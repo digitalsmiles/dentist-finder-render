@@ -28,23 +28,16 @@ JITTER = 0.25
 MAX_HTML_BYTES = 1_800_000
 MAX_WORKERS = 4
 
-BINARY_EXTS = (
-    ".pdf",".doc",".docx",".xls",".xlsx",".ppt",".pptx",".zip",".rar",
-    ".png",".jpg",".jpeg",".gif",".svg",".webp",".mp4",".avi",".mov",".wmv"
-)
+BINARY_EXTS = (".pdf",".doc",".docx",".xls",".xlsx",".ppt",".pptx",".zip",".rar",
+               ".png",".jpg",".jpeg",".gif",".svg",".webp",".mp4",".avi",".mov",".wmv")
 
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-    )
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 }
 
-DEFAULT_LIKELY = [
-    "contact","contact-us","book","appointments","about","about-us",
-    "our-team","team","meet-the-team","our-doctors","our-dentists",
-    "dentists","staff","people"
-]
+DEFAULT_LIKELY = ["contact","contact-us","book","appointments",
+                  "about","about-us","our-team","team","meet-the-team",
+                  "our-doctors","our-dentists","dentists","staff","people"]
 
 EMAIL_RE = re.compile(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", re.I)
 
@@ -60,8 +53,7 @@ def make_session():
         allowed_methods=frozenset(["GET","HEAD","OPTIONS"]),
     )
     adapter = HTTPAdapter(max_retries=retry, pool_connections=32, pool_maxsize=64)
-    s.mount("http://", adapter)
-    s.mount("https://", adapter)
+    s.mount("http://", adapter); s.mount("https://", adapter)
     s.headers.update(HEADERS)
     return s
 
@@ -103,15 +95,12 @@ def http_get(url: str):
     return None, url
 
 def clean_url(base, href):
-    if not href:
-        return None
+    if not href: return None
     href = href.strip()
-    if href.startswith(("#","mailto:","tel:")):
-        return None
+    if href.startswith(("#","mailto:","tel:")): return None
     absu = urljoin(base, href)
     u = urlparse(absu)
-    if any(u.path.lower().endswith(ext) for ext in BINARY_EXTS):
-        return None
+    if any(u.path.lower().endswith(ext) for ext in BINARY_EXTS): return None
     return u._replace(fragment="").geturl()
 
 def same_site(a, b):
@@ -122,11 +111,9 @@ def extract_emails(soup: BeautifulSoup):
     found = set()
     for a in soup.select("a[href^='mailto:']"):
         addr = a.get("href","").split("mailto:")[-1].split("?")[0].strip()
-        if EMAIL_RE.fullmatch(addr):
-            found.add(addr)
+        if EMAIL_RE.fullmatch(addr): found.add(addr)
     text = soup.get_text(" ", strip=True)
-    for m in EMAIL_RE.finditer(text):
-        found.add(m.group(0))
+    for m in EMAIL_RE.finditer(text): found.add(m.group(0))
     return found
 
 def normalize_name(txt: str):
@@ -136,21 +123,14 @@ def normalize_name(txt: str):
 
 def guess_principal(text: str):
     t = re.sub(r"\s+"," ", text)
-    pat1 = re.compile(
-        r"(Dr\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\s*(?:,|\s|-)?\s*"
-        r"(Principal\s+Dentist|Practice\s+Owner|Owner|Lead\s+Dentist|Clinical\s+Director)", re.I)
+    pat1 = re.compile(r"(Dr\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\s*(?:,|\s|-)?\s*(Principal\s+Dentist|Practice\s+Owner|Owner|Lead\s+Dentist|Clinical\s+Director)", re.I)
     m = pat1.search(t)
-    if m:
-        return normalize_name(m.group(1))
-    pat2 = re.compile(
-        r"(Principal\s+Dentist|Practice\s+Owner|Owner|Lead\s+Dentist|Clinical\s+Director)"
-        r"\s*[:\-]?\s*(Dr\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})", re.I)
+    if m: return normalize_name(m.group(1))
+    pat2 = re.compile(r"(Principal\s+Dentist|Practice\s+Owner|Owner|Lead\s+Dentist|Clinical\s+Director)\s*[:\-]?\s*(Dr\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})", re.I)
     m = pat2.search(t)
-    if m:
-        return normalize_name(m.group(2))
+    if m: return normalize_name(m.group(2))
     m = re.search(r"(Dr\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})", t)
-    if m:
-        return normalize_name(m.group(1))
+    if m: return normalize_name(m.group(1))
     return ""
 
 def path_matches(u: str, tokens: list[str]):
@@ -169,8 +149,7 @@ def crawl_site(site_url: str, max_pages: int, max_seconds: int, progress_cb=None
     tokens = tokens or DEFAULT_LIKELY
     t0 = time.time()
     html, canon = http_get(site_url)
-    if not html:
-        return "", set(), "", site_url
+    if not html: return "", set(), "", site_url
 
     queue, seen = deque(), set()
     queue.append(canon); seen.add(canon)
@@ -205,14 +184,12 @@ def crawl_site(site_url: str, max_pages: int, max_seconds: int, progress_cb=None
         soup = BeautifulSoup(html, "lxml")
 
         found = extract_emails(soup)
-        for e in found:
-            email_src.setdefault(e, final_url)
+        for e in found: email_src.setdefault(e, final_url)
         emails |= found
 
         if not principal:
             g = guess_principal(soup.get_text(" ", strip=True))
-            if g:
-                principal, principal_src = g, final_url
+            if g: principal, principal_src = g, final_url
 
         if fast_mode and (emails or principal) and (only_paths or path_matches(final_url, tokens)):
             if progress_cb: progress_cb(pages_scanned, max_pages)
@@ -224,8 +201,7 @@ def crawl_site(site_url: str, max_pages: int, max_seconds: int, progress_cb=None
                 if (not only_paths) or path_matches(u, tokens):
                     seen.add(u); queue.append(u)
 
-        if progress_cb:
-            progress_cb(pages_scanned, max_pages)
+        if progress_cb: progress_cb(pages_scanned, max_pages)
         time.sleep(CRAWL_SLEEP + random.random() * JITTER)
 
     first_email_source = next(iter(emails)) if emails else ""
@@ -243,9 +219,7 @@ def fetch_nearby_all_pages(gmaps_client, center, radius_m, type_="dentist"):
             out.extend(resp.get("results", []))
             while "next_page_token" in resp:
                 time.sleep(NEARBY_SLEEP + random.random() * JITTER)
-                resp = gmaps_client.places_nearby(
-                    location=center, radius=radius_m, type=type_, page_token=resp["next_page_token"]
-                )
+                resp = gmaps_client.places_nearby(location=center, radius=radius_m, type=type_, page_token=resp["next_page_token"])
                 out.extend(resp.get("results", []))
             return out
         except Exception:
@@ -306,8 +280,7 @@ def geocode_viewport(gmaps_client, place_text: str):
         east, west   = max(east, west),   min(east, west)
         return north, south, east, west
     loc = geom.get("location")
-    if not loc:
-        return None
+    if not loc: return None
     lat, lng = float(loc["lat"]), float(loc["lng"])
     dlat, dlon = km_to_deg(lat, 50.0)
     return lat + dlat, lat - dlat, lng + dlon, lng - dlon
@@ -324,7 +297,7 @@ def set_job(**updates):
         job.update(updates)
 
 # ==========================
-# Dash app & layout (labeled)
+# Dash app & layout  (ONLY LABELS ADDED)
 # ==========================
 app = Dash(__name__, title="Dental Finder (Dash)", suppress_callback_exceptions=True)
 server = app.server
@@ -334,80 +307,57 @@ app.layout = html.Div(
     children=[
         html.H2("Dental Finder 🦷 — Dash (Region Sweep only)"),
 
-        html.Div([
-            html.Label("Google API key (optional if set as env var)"),
-            dcc.Input(id="api_key", type="password", style={"width":"420px"})
-        ]),
+        # API key
+        html.Label("Google API key (optional if set as env var)"),
+        dcc.Input(id="api_key", placeholder="•••••••", type="password", style={"width":"420px"}),
+        html.Br(), html.Br(),
 
-        html.Br(),
+        # Place
+        html.Label("Place (AU city / suburb / state / postcode)"),
+        dcc.Input(id="place_text", value="Brisbane QLD", style={"width":"60%"}),
 
-        html.Div([
-            html.Label("Place (AU city / suburb / state / postcode)"),
-            dcc.Input(id="place_text", value="Brisbane QLD", style={"width":"60%"})
-        ]),
-
-        html.Br(),
-
+        # Sweep geometry & caps
         html.Div([
             html.Div([
                 html.Label("Nearby radius (km)"),
-                dcc.Input(id="radius_km", type="number", value=2.5, step=0.5)
+                dcc.Input(id="radius_km", type="number", value=2.5, step=0.5, placeholder="Radius km"),
             ]),
             html.Div([
                 html.Label("Tile overlap (step factor)"),
-                dcc.Input(id="step_factor", type="number", value=1.5, step=0.1)
+                dcc.Input(id="step_factor", type="number", value=1.5, step=0.1, placeholder="Step factor", style={"marginLeft":"8px"}),
             ]),
             html.Div([
                 html.Label("Max tiles (center-out)"),
-                dcc.Input(id="max_tiles", type="number", value=200, step=10)
+                dcc.Input(id="max_tiles", type="number", value=200, step=10, placeholder="Max tiles", style={"marginLeft":"8px"}),
             ]),
             html.Div([
                 html.Label("Max clinics to collect"),
-                dcc.Input(id="max_total_places", type="number", value=3000, step=100)
+                dcc.Input(id="max_total_places", type="number", value=3000, step=100, placeholder="Max clinics", style={"marginLeft":"8px"}),
             ]),
-        ], style={
-            "display":"grid",
-            "gridTemplateColumns":"repeat(4, minmax(180px, 1fr))",
-            "gap":"10px"
-        }),
+        ], style={"marginTop":"8px","display":"grid","gridTemplateColumns":"repeat(4, minmax(180px,1fr))","gap":"10px"}),
 
-        html.Br(),
-
+        # Crawler limits & options
         html.Div([
             html.Div([
                 html.Label("Max pages per site"),
-                dcc.Input(id="max_pages_per_site", type="number", value=20, step=1)
+                dcc.Input(id="max_pages_per_site", type="number", value=20, step=1, placeholder="Max pages/site"),
             ]),
             html.Div([
                 html.Label("Max seconds per site"),
-                dcc.Input(id="max_seconds_per_site", type="number", value=30, step=5)
+                dcc.Input(id="max_seconds_per_site", type="number", value=30, step=5, placeholder="Max seconds/site", style={"marginLeft":"8px"}),
             ]),
             html.Div([
                 html.Label("Fast mode"),
-                dcc.Checklist(
-                    id="fast_mode",
-                    options=[{"label":" Stop after first lead on likely pages","value":"on"}],
-                    value=["on"]
-                )
-            ]),
+                dcc.Checklist(id="fast_mode", options=[{"label":" Stop after first lead on likely pages","value":"on"}], value=["on"]),
+            ], style={"paddingTop":"6px"}),
             html.Div([
                 html.Label("Only crawl likely paths"),
-                dcc.Checklist(
-                    id="only_paths",
-                    options=[{"label":" contact, about, team, staff…","value":"on"}],
-                    value=[]
-                )
-            ]),
-        ], style={
-            "display":"grid",
-            "gridTemplateColumns":"repeat(4, minmax(220px, 1fr))",
-            "gap":"10px"
-        }),
+                dcc.Checklist(id="only_paths", options=[{"label":" contact, about, team, staff…","value":"on"}], value=[]),
+            ], style={"paddingTop":"6px"}),
+        ], style={"marginTop":"8px","display":"grid","gridTemplateColumns":"repeat(4, minmax(220px,1fr))","gap":"10px"}),
 
-        html.Div([
-            html.Label("Paths list (comma-separated)"),
-            dcc.Input(id="paths_txt", value="contact,about,team,staff", style={"width":"60%"})
-        ], style={"marginTop":"8px"}),
+        html.Label("Paths list (comma-separated)"),
+        dcc.Input(id="paths_txt", value="contact,about,team,staff", style={"width":"60%","marginTop":"4px"}),
 
         html.Br(),
         html.Button("Start sweep", id="start", n_clicks=0, style={"padding":"8px 14px"}),
@@ -418,11 +368,9 @@ app.layout = html.Div(
         html.Div(id="progress-info", style={"marginTop":"6px"}),
 
         html.Hr(),
-        dash_table.DataTable(
-            id="table", page_size=10,
+        dash_table.DataTable(id="table", page_size=10,
             style_cell={"whiteSpace":"normal","height":"auto"},
-            style_table={"maxHeight":"520px","overflowY":"auto"}
-        ),
+            style_table={"maxHeight":"520px","overflowY":"auto"}),
 
         html.Br(),
         html.Button("Download CSV", id="download-btn"),
@@ -441,23 +389,20 @@ def run_job(args):
 
     api_key = (args["api_key"] or os.getenv("GOOGLE_API_KEY") or os.getenv("GMAPS_KEY") or "").strip()
     if not api_key:
-        set_job(running=False, error="No API key provided.")
-        return
+        set_job(running=False, error="No API key provided."); return
 
     gmaps_client = googlemaps.Client(key=api_key)
 
     vp = geocode_viewport(gmaps_client, args["place_text"])
     if not vp:
-        set_job(running=False, error="Could not geocode that place.")
-        return
+        set_job(running=False, error="Could not geocode that place."); return
     north, south, east, west = vp
 
     radius_km, step_factor = args["radius_km"], args["step_factor"]
     max_tiles, max_total_places = args["max_tiles"], args["max_total_places"]
 
     centers_all = list(make_grid(north, south, east, west, radius_km, step_factor))
-    center_lat = (north + south)/2.0
-    center_lon = (east + west)/2.0
+    center_lat = (north + south)/2.0; center_lon = (east + west)/2.0
     centers_sorted = sort_center_out(centers_all, center_lat, center_lon)
     centers = centers_sorted[:max_tiles] if len(centers_sorted) > max_tiles else centers_sorted
 
@@ -469,14 +414,11 @@ def run_job(args):
             pid = pl.get("place_id")
             if pid and pid not in place_ids:
                 place_ids[pid] = pl
-                if len(place_ids) >= max_total_places:
-                    break
-        if len(place_ids) >= max_total_places:
-            break
+                if len(place_ids) >= max_total_places: break
+        if len(place_ids) >= max_total_places: break
 
     if not place_ids:
-        set_job(running=False, error="No clinics found.")
-        return
+        set_job(running=False, error="No clinics found."); return
 
     ids = list(place_ids.keys())
     tokens = [t.strip().strip("/") for t in (args["paths_txt"] or "").split(",") if t.strip()] or DEFAULT_LIKELY
@@ -491,30 +433,21 @@ def run_job(args):
     def worker(pid):
         det = gmaps_place_details(gmaps_client, pid)
         r = det.get("result", {})
-        practice = r.get("name")
-        addr = r.get("formatted_address")
+        practice = r.get("name"); addr = r.get("formatted_address")
         site = (r.get("website") or "").strip()
 
         principal, emails, email_src, principal_src = ("", set(), "", "")
         if site:
             principal, emails, email_src, principal_src = crawl_site(
-                site,
-                max_pages=max_pages_per_site,
-                max_seconds=max_seconds_per_site,
-                progress_cb=None,
-                fast_mode=fast_mode,
-                only_paths=only_paths,
-                tokens=tokens,
+                site, max_pages=max_pages_per_site, max_seconds=max_seconds_per_site,
+                progress_cb=None, fast_mode=fast_mode, only_paths=only_paths, tokens=tokens
             )
         return {
-            "Practice": practice or "",
-            "Address": addr or "",
-            "Website": site,
+            "Practice": practice or "", "Address": addr or "", "Website": site,
             "Principal / Owner (guess)": principal,
             "Emails found": ", ".join(sorted(emails)) if emails else "",
-            "First email source": email_src,
-            "Principal source": principal_src or site,
-            "Place ID": pid,
+            "First email source": email_src, "Principal source": principal_src or site,
+            "Place ID": pid
         }
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
@@ -526,19 +459,13 @@ def run_job(args):
                 try:
                     row = fut.result(timeout=PLACE_TIMEOUT)
                 except FuturesTimeout:
-                    row = {
-                        "Practice":"","Address":"","Website":"",
-                        "Principal / Owner (guess)":"","Emails found":"",
-                        "First email source":"","Principal source":"",
-                        "Place ID": futures[fut], "Error": f"Timeout after {PLACE_TIMEOUT}s"
-                    }
+                    row = {"Practice":"","Address":"","Website":"","Principal / Owner (guess)":"",
+                           "Emails found":"","First email source":"","Principal source":"",
+                           "Place ID": futures[fut], "Error": f"Timeout after {PLACE_TIMEOUT}s"}
                 except Exception as e:
-                    row = {
-                        "Practice":"","Address":"","Website":"",
-                        "Principal / Owner (guess)":"","Emails found":"",
-                        "First email source":"","Principal source":"",
-                        "Place ID": futures[fut], "Error": str(e)
-                    }
+                    row = {"Practice":"","Address":"","Website":"","Principal / Owner (guess)":"",
+                           "Emails found":"","First email source":"","Principal source":"",
+                           "Place ID": futures[fut], "Error": str(e)}
                 rows_buffer.append(row)
                 with job_lock:
                     job["current"] += 1
@@ -550,17 +477,10 @@ def run_job(args):
         df = df.drop_duplicates(subset=["Place ID"]).reset_index(drop=True)
 
     buf = io.BytesIO()
-    df.to_csv(buf, index=False)
-    buf.seek(0)
+    df.to_csv(buf, index=False); buf.seek(0)
 
-    set_job(
-        running=False,
-        progress=f"Done. {len(df)} clinics.",
-        rows=df.to_dict("records"),
-        csv_bytes=buf.read(),
-        error="",
-        total=len(ids),
-    )
+    set_job(running=False, progress=f"Done. {len(df)} clinics.", rows=df.to_dict("records"),
+            csv_bytes=buf.read(), error="", total=len(ids))
 
 # --------------------------
 # Poll UI for progress
@@ -574,12 +494,8 @@ def run_job(args):
 )
 def poll_status(_):
     with job_lock:
-        running = job["running"]
-        prog = job["progress"]
-        cur = job["current"]
-        tot = job["total"]
-        rows = job["rows"]
-        err = job["error"]
+        running = job["running"]; prog = job["progress"]; cur = job["current"]
+        tot = job["total"]; rows = job["rows"]; err = job["error"]
     if err:
         return f"❌ {err}", None, "", []
 
