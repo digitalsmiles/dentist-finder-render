@@ -20,21 +20,21 @@ st.title("Dental Finder 🦷 — region sweep + email/principal scraper (center-
 FAST_MODE_DEFAULT = True
 
 # Network timeouts
-CONNECT_TIMEOUT = 5            # fast fail on connect
-READ_TIMEOUT = 20              # allow some slow pages
+CONNECT_TIMEOUT = 5
+READ_TIMEOUT = 20
 TIMEOUT = (CONNECT_TIMEOUT, READ_TIMEOUT)
 
-# Per-place hard cap (covers Google details + site crawl)
-PLACE_TIMEOUT = 90             # seconds per clinic hard cap
+# Per-place hard cap
+PLACE_TIMEOUT = 90
 
 # Retries / pacing
 RETRIES = 3
 CRAWL_SLEEP = 0.5
-NEARBY_SLEEP = 2.1            # Google Places next_page pacing
-JITTER = 0.25                 # small random jitter to avoid lock-step
-MAX_HTML_BYTES = 1_800_000    # ~1.8 MB — skip massive pages
+NEARBY_SLEEP = 2.1
+JITTER = 0.25
+MAX_HTML_BYTES = 1_800_000
 
-# Concurrency (per-place only; keeps UI alive, prevents global stall)
+# Concurrency (per-place only)
 MAX_WORKERS = 4
 
 BINARY_EXTS = (".pdf",".doc",".docx",".xls",".xlsx",".ppt",".pptx",".zip",".rar",
@@ -90,7 +90,7 @@ def make_session():
         connect=RETRIES,
         read=RETRIES,
         status=RETRIES,
-        backoff_factor=0.6,              # 0.6, 1.2, 2.4s...
+        backoff_factor=0.6,
         status_forcelist=[408, 409, 425, 429, 500, 502, 503, 504],
         allowed_methods=frozenset(["GET", "HEAD", "OPTIONS"])
     )
@@ -105,7 +105,13 @@ SESSION = make_session()
 # ==========================
 # UI Controls
 # ==========================
-api_key = st.secrets.get("GMAPS_KEY", "").strip()
+# 🔑 Read key from Render env vars first; fall back to st.secrets; finally to a text box.
+api_key = (
+    os.getenv("GMAPS_KEY", "")
+    or os.getenv("GOOGLE_API_KEY", "")
+    or st.secrets.get("GMAPS_KEY", "")
+    or st.secrets.get("GOOGLE_API_KEY", "")
+).strip()
 if not api_key:
     api_key = st.text_input("Google Maps API key", type="password").strip()
 
@@ -154,7 +160,6 @@ run = st.button("Run")
 # HTTP helpers
 # ==========================
 def http_get(url: str):
-    # Defensive GET with content-type and length checks
     for i in range(RETRIES + 1):
         try:
             r = SESSION.get(url, timeout=TIMEOUT, allow_redirects=True, stream=True)
@@ -162,14 +167,11 @@ def http_get(url: str):
                 raise requests.RequestException(f"HTTP {r.status_code}")
             ctype = (r.headers.get("Content-Type","") or "").lower()
             if "text/html" not in ctype:
-                # not HTML, skip
                 return None, url
             clen = r.headers.get("Content-Length")
             if clen and int(clen) > MAX_HTML_BYTES:
                 return None, url
-            # Read up to MAX_HTML_BYTES
-            chunks = []
-            total = 0
+            chunks, total = [], 0
             for chunk in r.iter_content(chunk_size=16384, decode_unicode=True):
                 if chunk:
                     if isinstance(chunk, bytes):
@@ -275,7 +277,7 @@ def crawl_site(site_url: str, max_pages: int, max_seconds: int, progress_cb=None
 
     pages_scanned = 0
     while queue and pages_scanned < max_pages and (time.time() - t0) < max_seconds:
-        url = queue.pop()  # depth-ish, tends to reach contact/about faster
+        url = queue.pop()
         pages_scanned += 1
 
         if only_paths and url != canon and not path_matches(url, tokens):
@@ -436,7 +438,6 @@ def process_place(gmaps_client, pid, max_pages_per_site, max_seconds_per_site, f
     addr = r.get("formatted_address")
     site = (r.get("website") or "").strip()
 
-    # local progress bar for site crawl
     site_prog = st.progress(0.0)
 
     def _site_cb(done, cap):
@@ -476,7 +477,6 @@ def process_place(gmaps_client, pid, max_pages_per_site, max_seconds_per_site, f
 # Heartbeat (keeps UI active)
 # ==========================
 def ui_heartbeat():
-    # lightweight heartbeat element updated periodically
     hb = st.empty()
     return hb
 
@@ -493,7 +493,6 @@ if run and api_key:
     try:
         gmaps_client = googlemaps.Client(key=api_key)
 
-        # dynamic file names per run context
         if mode == "Text Search (max 60)":
             name_hint = slugify(query or "text_search")
         elif mode == "Citywide Sweep (manual bounds)":
@@ -504,7 +503,6 @@ if run and api_key:
         OUT_CSV   = f"{name_hint}_dental_clinics_with_emails.csv"
         CKPT_JSON = f"{name_hint}_scrape_ckpt.json"
 
-        # -------- DISCOVERY PHASE --------
         place_ids = {}
         if mode == "Text Search (max 60)":
             all_places = gmaps_text_search_all(gmaps_client, query)
@@ -525,6 +523,31 @@ if run and api_key:
                 north, south, east, west = vp
                 st.caption(f"Viewport for {place_text}: N {north:.4f} S {south:.4f} E {east:.4f} W {west:.4f}")
                 bounds = (north, south, east, west)
+
+            def km_to_deg(lat_deg: float, km: float):
+                deg_lat = km / 111.0
+                deg_lon = km / (111.320 * math.cos(math.radians(lat_deg)) or 1e-6)
+                return deg_lat, deg_lon
+
+            def make_grid(north, south, east, west, radius_km, step_factor=1.6):
+                mid_lat = (north + south) / 2.0
+                step_km = radius_km * step_factor
+                dlat, dlon = km_to_deg(mid_lat, step_km)
+                lat = south + dlat/2.0
+                while lat < north:
+                    lon = west + dlon/2.0
+                    while lon < east:
+                        yield (lat, lon)
+                        lon += dlon
+                    lat += dlat
+
+            def sort_center_out(points, center_lat, center_lon):
+                def key(pt):
+                    lat, lon = pt
+                    dx = (lon - center_lon) * math.cos(math.radians(center_lat))
+                    dy = (lat - center_lat)
+                    return dx*dx + dy*dy
+                return sorted(points, key=key)
 
             centers_all = list(make_grid(*bounds, radius_km, step_factor))
             center_lat = (north + south)/2.0
@@ -554,7 +577,6 @@ if run and api_key:
         if not place_ids:
             st.warning("No clinics found."); st.stop()
 
-        # -------- RESUME INDEX --------
         start_idx = load_resume_index(CKPT_JSON)
         ids = list(place_ids.keys())
         if start_idx >= len(ids): start_idx = 0
@@ -564,41 +586,33 @@ if run and api_key:
         overall = st.progress(0.0, text="Processing clinics…")
         hb = ui_heartbeat()
 
-        # -------- DETAILS + SCRAPE PHASE (bounded per place) --------
+        def process_place_wrapper(pid):
+            return process_place(gmaps_client, pid,
+                                 max_pages_per_site, max_seconds_per_site,
+                                 fast_mode, only_paths, tokens)
+
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
             idx = start_idx
             while idx < len(ids):
                 batch = ids[idx : min(idx + MAX_WORKERS, len(ids))]
-                futures = {pool.submit(process_place, gmaps_client, pid,
-                                       max_pages_per_site, max_seconds_per_site,
-                                       fast_mode, only_paths, tokens): pid for pid in batch}
+                futures = {pool.submit(process_place_wrapper, pid): pid for pid in batch}
 
                 for j, (fut, pid) in enumerate(list(futures.items()), start=1):
                     try:
                         row = fut.result(timeout=PLACE_TIMEOUT)
                     except FuturesTimeout:
                         row = {
-                            "Practice": "",
-                            "Address": "",
-                            "Website": "",
-                            "Principal / Owner (guess)": "",
-                            "Emails found": "",
-                            "First email source": "",
-                            "Principal source": "",
-                            "Place ID": pid,
-                            "Error": f"Timeout after {PLACE_TIMEOUT}s"
+                            "Practice": "", "Address": "", "Website": "",
+                            "Principal / Owner (guess)": "", "Emails found": "",
+                            "First email source": "", "Principal source": "",
+                            "Place ID": pid, "Error": f"Timeout after {PLACE_TIMEOUT}s"
                         }
                     except Exception as e:
                         row = {
-                            "Practice": "",
-                            "Address": "",
-                            "Website": "",
-                            "Principal / Owner (guess)": "",
-                            "Emails found": "",
-                            "First email source": "",
-                            "Principal source": "",
-                            "Place ID": pid,
-                            "Error": str(e)
+                            "Practice": "", "Address": "", "Website": "",
+                            "Principal / Owner (guess)": "", "Emails found": "",
+                            "First email source": "", "Principal source": "",
+                            "Place ID": pid, "Error": str(e)
                         }
 
                     rows_buffer.append(row)
@@ -611,15 +625,12 @@ if run and api_key:
                         checkpoint(cur, rows_buffer, OUT_CSV, CKPT_JSON)
                         rows_buffer = []
 
-                    # tiny yield to UI
                     time.sleep(0.05)
 
                 idx += len(batch)
 
-        # Final checkpoint & UI
         checkpoint(len(ids), rows_buffer, OUT_CSV, CKPT_JSON)
 
-        # -------- LOAD & DISPLAY --------
         if os.path.exists(OUT_CSV):
             df = pd.read_csv(OUT_CSV)
         else:
@@ -642,4 +653,4 @@ if run and api_key:
         st.error(f"Error: {e}")
 
 elif run and not api_key:
-    st.info("Add your key in Settings → Secrets as GMAPS_KEY, or paste it above.")
+    st.info("Add your key in Render → Environment as GMAPS_KEY (or GOOGLE_API_KEY), or paste it above.")
