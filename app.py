@@ -1,9 +1,7 @@
-import os, re, time, math, json, random, unicodedata
+import os, re, time, math, json, random, unicodedata, threading, io
 from urllib.parse import urljoin, urlparse
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
-import threading
-from typing import List, Dict, Any, Tuple
 
 import requests
 import pandas as pd
@@ -12,12 +10,10 @@ from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from dash import Dash, html, dcc, Input, Output, State, dash_table
-from flask import send_file
-import io
+from dash import Dash, html, dcc, Input, Output, State, dash_table, no_update
 
 # ==========================
-# Tunables (same as before)
+# Tunables
 # ==========================
 FAST_MODE_DEFAULT = True
 CONNECT_TIMEOUT = 5
@@ -44,9 +40,10 @@ DEFAULT_LIKELY = ["contact","contact-us","book","appointments",
                   "our-doctors","our-dentists","dentists","staff","people"]
 
 EMAIL_RE = re.compile(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", re.I)
-FLUSH_EVERY = 20
 
-# ---------- HTTP session with retry ----------
+# ==========================
+# HTTP session with retry
+# ==========================
 def make_session():
     s = requests.Session()
     retry = Retry(
@@ -62,24 +59,13 @@ def make_session():
 
 SESSION = make_session()
 
-# ---------- small utilities ----------
+# ==========================
+# Utils
+# ==========================
 def slugify(s: str):
     s = unicodedata.normalize("NFKD", s).encode("ascii","ignore").decode("ascii")
-    s = re.sub(r"[^A-Za-z0-9]+", "_", s).strip("_")
+    s = re.sub(r"[^A-Za-z0-9]+","_", s).strip("_")
     return s.lower() or "output"
-
-def clean_url(base, href):
-    if not href: return None
-    href = href.strip()
-    if href.startswith(("#","mailto:","tel:")): return None
-    absu = urljoin(base, href)
-    u = urlparse(absu)
-    if any(u.path.lower().endswith(ext) for ext in BINARY_EXTS): return None
-    return u._replace(fragment="").geturl()
-
-def same_site(a, b):
-    ua, ub = urlparse(a), urlparse(b)
-    return (ua.scheme, ua.netloc) == (ub.scheme, ub.netloc)
 
 def http_get(url: str):
     for i in range(RETRIES + 1):
@@ -107,6 +93,19 @@ def http_get(url: str):
             pass
         time.sleep(0.4 * (2 ** i) + random.random() * JITTER)
     return None, url
+
+def clean_url(base, href):
+    if not href: return None
+    href = href.strip()
+    if href.startswith(("#","mailto:","tel:")): return None
+    absu = urljoin(base, href)
+    u = urlparse(absu)
+    if any(u.path.lower().endswith(ext) for ext in BINARY_EXTS): return None
+    return u._replace(fragment="").geturl()
+
+def same_site(a, b):
+    ua, ub = urlparse(a), urlparse(b)
+    return (ua.scheme, ua.netloc) == (ub.scheme, ub.netloc)
 
 def extract_emails(soup: BeautifulSoup):
     found = set()
@@ -142,6 +141,9 @@ def prioritise(urls, tokens):
     def score(u): return 0 if path_matches(u, tokens) else 1
     return sorted(set(urls), key=score)
 
+# ==========================
+# Site crawler (bounded)
+# ==========================
 def crawl_site(site_url: str, max_pages: int, max_seconds: int, progress_cb=None,
                fast_mode=True, only_paths=False, tokens=None):
     tokens = tokens or DEFAULT_LIKELY
@@ -169,13 +171,16 @@ def crawl_site(site_url: str, max_pages: int, max_seconds: int, progress_cb=None
 
     while queue and pages_scanned < max_pages and (time.time() - t0) < max_seconds:
         url = queue.pop(); pages_scanned += 1
+
         if only_paths and url != canon and not path_matches(url, tokens):
             if progress_cb: progress_cb(pages_scanned, max_pages)
             continue
+
         html, final_url = http_get(url)
         if not html:
             if progress_cb: progress_cb(pages_scanned, max_pages)
             continue
+
         soup = BeautifulSoup(html, "lxml")
 
         found = extract_emails(soup)
@@ -203,7 +208,9 @@ def crawl_site(site_url: str, max_pages: int, max_seconds: int, progress_cb=None
     first_email_source = first_email_source and email_src.get(first_email_source, "")
     return principal, emails, first_email_source, principal_src
 
-# ---------- Google helpers ----------
+# ==========================
+# Google helpers
+# ==========================
 def fetch_nearby_all_pages(gmaps_client, center, radius_m, type_="dentist"):
     out = []
     for attempt in range(RETRIES + 1):
@@ -248,7 +255,6 @@ def gmaps_place_details(gmaps_client, place_id):
             time.sleep(0.6 * (2 ** attempt) + random.random() * JITTER)
     return {"result": {}}
 
-# ---------- Grid helpers ----------
 def km_to_deg(lat_deg: float, km: float):
     deg_lat = km / 111.0
     deg_lon = km / (111.320 * math.cos(math.radians(lat_deg)) or 1e-6)
@@ -274,10 +280,36 @@ def sort_center_out(points, center_lat, center_lon):
         return dx*dx + dy*dy
     return sorted(points, key=key)
 
+def geocode_viewport(gmaps_client, place_text: str):
+    g = None
+    for attempt in range(RETRIES + 1):
+        try:
+            g = gmaps_client.geocode(place_text, region="au")
+            break
+        except Exception:
+            time.sleep(0.6 * (2 ** attempt) + random.random() * JITTER)
+    if not g:
+        return None
+    res = g[0]
+    geom = res.get("geometry", {})
+    vp = geom.get("viewport")
+    if vp:
+        ne = vp.get("northeast", {}); sw = vp.get("southwest", {})
+        north, south = float(ne.get("lat")), float(sw.get("lat"))
+        east, west   = float(ne.get("lng")), float(sw.get("lng"))
+        north, south = max(north, south), min(north, south)
+        east, west   = max(east, west),   min(east, west)
+        return north, south, east, west
+    loc = geom.get("location")
+    if not loc: return None
+    lat, lng = float(loc["lat"]), float(loc["lng"])
+    dlat, dlon = km_to_deg(lat, 50.0)
+    return lat + dlat, lat - dlat, lng + dlon, lng - dlon
+
 # ==========================
 # Background job state
 # ==========================
-job: Dict[str, Any] = {
+job = {
     "running": False,
     "progress": "Idle",
     "current": 0,
@@ -286,7 +318,6 @@ job: Dict[str, Any] = {
     "csv_bytes": b"",
     "error": "",
 }
-
 job_lock = threading.Lock()
 
 def set_job(**updates):
@@ -294,58 +325,60 @@ def set_job(**updates):
         job.update(updates)
 
 # ==========================
-# Dash app
+# Dash app & layout
 # ==========================
 app = Dash(__name__, title="Dental Finder (Dash)")
 server = app.server
 
-app.layout = html.Div(style={"fontFamily":"system-ui,-apple-system,Segoe UI,Arial","maxWidth":"1100px","margin":"0 auto","padding":"18px"}, children=[
-    html.H2("Dental Finder 🦷 — Dash"),
-    html.Div("Enter your Google Maps key below or set GOOGLE_API_KEY/GMAPS_KEY in the environment."),
-    html.Br(),
+app.layout = html.Div(
+    style={"fontFamily":"system-ui,-apple-system,Segoe UI,Arial","maxWidth":"1100px","margin":"0 auto","padding":"18px"},
+    children=[
+        html.H2("Dental Finder 🦷 — Dash"),
+        dcc.Input(id="api_key", placeholder="Google API key (optional if set as env var)", type="password", style={"width":"420px"}),
+        html.Br(), html.Br(),
+        dcc.Dropdown(
+            id="mode",
+            options=[
+                {"label":"Text Search (max 60)","value":"text"},
+                {"label":"Citywide Sweep (manual bounds)","value":"bounds"},
+                {"label":"Region Sweep by place name","value":"region"},
+            ],
+            value="text",
+            style={"width":"360px"}
+        ),
+        html.Div(id="mode-controls", style={"marginTop":"10px"}),
 
-    dcc.Input(id="api_key", placeholder="Google API key (optional)", type="password", style={"width":"420px"}),
-    html.Div(style={"height":"10px"}),
+        html.Br(),
+        html.Button("Start sweep", id="start", n_clicks=0, style={"padding":"8px 14px"}),
+        html.Span(id="status", style={"marginLeft":"12px"}),
 
-    dcc.Dropdown(
-        id="mode",
-        options=[
-            {"label":"Text Search (max 60)","value":"text"},
-            {"label":"Citywide Sweep (manual bounds)","value":"bounds"},
-            {"label":"Region Sweep by place name","value":"region"},
-        ],
-        value="text",
-        style={"width":"360px"}
-    ),
+        html.Div(style={"height":"14px"}),
+        html.Div(id="progress-bar", style={"height":"10px","background":"#eee","borderRadius":"6px","overflow":"hidden"}),
+        html.Div(id="progress-info", style={"marginTop":"6px"}),
 
-    html.Div(id="mode-controls"),
+        html.Hr(),
+        dash_table.DataTable(id="table", page_size=10,
+            style_cell={"whiteSpace":"normal","height":"auto"},
+            style_table={"maxHeight":"520px","overflowY":"auto"}),
 
-    html.Br(),
-    html.Button("Start sweep", id="start", n_clicks=0, style={"padding":"8px 14px"}),
-    html.Span(id="status", style={"marginLeft":"12px"}),
+        html.Br(),
+        html.Button("Download CSV", id="download-btn"),
+        dcc.Download(id="download"),
 
-    html.Div(style={"height":"14px"}),
-    html.Div(id="progress-bar", style={"height":"10px","background":"#eee","borderRadius":"6px","overflow":"hidden"}),
-    html.Div(id="progress-info", style={"marginTop":"6px"}),
+        # Hidden store to avoid duplicate-output issues
+        dcc.Store(id="kick"),
+        # Polling timer
+        dcc.Interval(id="poll", interval=1500, n_intervals=0),
+    ]
+)
 
-    html.Hr(),
-    dash_table.DataTable(id="table", page_size=10, style_cell={"whiteSpace":"normal","height":"auto"}, style_table={"maxHeight":"520px","overflowY":"auto"}),
-    html.Br(),
-    html.Button("Download CSV", id="download-btn"),
-    dcc.Download(id="download"),
-
-    # Polling
-    dcc.Interval(id="poll", interval=1500, n_intervals=0)
-])
-
-# ---- dynamic controls based on mode ----
+# Dynamic controls per mode
 @app.callback(Output("mode-controls","children"), Input("mode","value"))
 def render_mode_controls(mode):
     if mode == "text":
         return html.Div([
             html.Label("Query"),
             dcc.Input(id="q", value="dentist Brisbane", style={"width":"60%"}),
-            html.Div(id="extra-text")
         ])
     elif mode == "bounds":
         return html.Div([
@@ -355,43 +388,37 @@ def render_mode_controls(mode):
                 dcc.Input(id="south", type="number", value=-27.75, step=0.00001, placeholder="South", style={"marginLeft":"8px"}),
                 dcc.Input(id="east",  type="number", value=153.30, step=0.00001, placeholder="East",  style={"marginLeft":"8px"}),
                 dcc.Input(id="west",  type="number", value=152.60, step=0.00001, placeholder="West",  style={"marginLeft":"8px"}),
-            ]),
-            html.Div(style={"height":"8px"}),
+            ], style={"marginTop":"6px"}),
             html.Div([
                 dcc.Input(id="radius_km", type="number", value=2.5, step=0.5, placeholder="Radius km"),
                 dcc.Input(id="step_factor", type="number", value=1.5, step=0.1, placeholder="Step factor", style={"marginLeft":"8px"}),
                 dcc.Input(id="max_tiles", type="number", value=200, step=10, placeholder="Max tiles", style={"marginLeft":"8px"}),
                 dcc.Input(id="max_total_places", type="number", value=3000, step=100, placeholder="Max clinics", style={"marginLeft":"8px"}),
-            ]),
+            ], style={"marginTop":"8px"}),
         ])
-    else: # region
+    else:  # region
         return html.Div([
             html.Label("Place (AU city/suburb/state/postcode)"),
             dcc.Input(id="place_text", value="Brisbane QLD", style={"width":"60%"}),
-            html.Div("Nearby radius / grid controls"),
             html.Div([
                 dcc.Input(id="radius_km", type="number", value=2.5, step=0.5, placeholder="Radius km"),
                 dcc.Input(id="step_factor", type="number", value=1.5, step=0.1, placeholder="Step factor", style={"marginLeft":"8px"}),
                 dcc.Input(id="max_tiles", type="number", value=200, step=10, placeholder="Max tiles", style={"marginLeft":"8px"}),
                 dcc.Input(id="max_total_places", type="number", value=3000, step=100, placeholder="Max clinics", style={"marginLeft":"8px"}),
-            ]),
+            ], style={"marginTop":"8px"}),
         ])
 
-# ==========================
-# Background worker
-# ==========================
+# Background job runner
 def run_job(args):
     set_job(running=True, progress="Starting…", current=0, total=0, rows=[], csv_bytes=b"", error="")
 
-    # Unpack args
-    mode = args["mode"]
-    api_key = args["api_key"] or os.getenv("GOOGLE_API_KEY") or os.getenv("GMAPS_KEY") or ""
+    api_key = (args["api_key"] or os.getenv("GOOGLE_API_KEY") or os.getenv("GMAPS_KEY") or "").strip()
     if not api_key:
         set_job(running=False, error="No API key provided."); return
 
     gmaps_client = googlemaps.Client(key=api_key)
+    mode = args["mode"]
 
-    # discovery
     place_ids = {}
     if mode == "text":
         query = args["query"]
@@ -400,13 +427,11 @@ def run_job(args):
             pid = pl.get("place_id")
             if pid: place_ids[pid] = pl
         name_hint = slugify(query or "text_search")
-
     else:
         if mode == "bounds":
             north, south, east, west = args["north"], args["south"], args["east"], args["west"]
             name_hint = "manual_bounds"
         else:
-            # region: geocode to viewport
             vp = geocode_viewport(gmaps_client, args["place_text"])
             if not vp:
                 set_job(running=False, error="Could not geocode that place."); return
@@ -451,8 +476,7 @@ def run_job(args):
         site = (r.get("website") or "").strip()
 
         def _site_cb(done, cap):
-            # we keep per-site progress local; global progress below
-            pass
+            pass  # per-site progress (not shown globally)
 
         principal, emails, email_src, principal_src = ("", set(), "", "")
         if site:
@@ -494,15 +518,13 @@ def run_job(args):
     if "Place ID" in df.columns:
         df = df.drop_duplicates(subset=["Place ID"]).reset_index(drop=True)
 
-    # prepare CSV in-memory
     buf = io.BytesIO()
     df.to_csv(buf, index=False); buf.seek(0)
 
-    set_job(running=False, progress="Done.", rows=df.to_dict("records"), csv_bytes=buf.read(), error="", total=len(ids))
+    set_job(running=False, progress="Done.", rows=df.to_dict("records"),
+            csv_bytes=buf.read(), error="", total=len(ids))
 
-# ==========================
-# Callbacks
-# ==========================
+# Poll UI for progress
 @app.callback(
     Output("status","children"),
     Output("progress-bar","children"),
@@ -512,9 +534,11 @@ def run_job(args):
 )
 def poll_status(_):
     with job_lock:
-        running = job["running"]; prog = job["progress"]; cur = job["current"]; tot = job["total"]; rows = job["rows"]; err = job["error"]
+        running = job["running"]; prog = job["progress"]; cur = job["current"]
+        tot = job["total"]; rows = job["rows"]; err = job["error"]
     if err:
         return f"❌ {err}", None, "", []
+
     bar = None
     if tot:
         pct = int(100 * (cur / max(1, tot)))
@@ -525,30 +549,34 @@ def poll_status(_):
     status = ("⏳ " if running else "✅ ") + prog
     return status, bar, info, rows
 
+# Start job (writes to hidden store to avoid duplicate-output conflicts)
 @app.callback(
-    Output("status","children", allow_duplicate=True),
+    Output("kick","data"),
     Input("start","n_clicks"),
     State("api_key","value"),
     State("mode","value"),
-    State("q","value", allow_missing=True),
-    State("north","value", allow_missing=True),
-    State("south","value", allow_missing=True),
-    State("east","value", allow_missing=True),
-    State("west","value", allow_missing=True),
-    State("place_text","value", allow_missing=True),
-    State("radius_km","value", allow_missing=True),
-    State("step_factor","value", allow_missing=True),
-    State("max_tiles","value", allow_missing=True),
-    State("max_total_places","value", allow_missing=True),
+    State("q","value"),
+    State("north","value"),
+    State("south","value"),
+    State("east","value"),
+    State("west","value"),
+    State("place_text","value"),
+    State("radius_km","value"),
+    State("step_factor","value"),
+    State("max_tiles","value"),
+    State("max_total_places","value"),
     prevent_initial_call=True
 )
-def start(n, api_key, mode, q, north, south, east, west, place_text, radius_km, step_factor, max_tiles, max_total_places):
-    if not n: return dash.no_update
+def start(n, api_key, mode, q, north, south, east, west, place_text,
+          radius_km, step_factor, max_tiles, max_total_places):
+    if not n:
+        return no_update
     if job["running"]:
-        return "Already running. Please wait…"
+        return {"msg":"already running"}
+
     args = {
         "mode": mode,
-        "api_key": api_key or "",
+        "api_key": (api_key or "").strip(),
         "query": q or "dentist Brisbane",
         "north": float(north) if north is not None else -27.00,
         "south": float(south) if south is not None else -27.75,
@@ -559,7 +587,6 @@ def start(n, api_key, mode, q, north, south, east, west, place_text, radius_km, 
         "step_factor": float(step_factor) if step_factor is not None else 1.5,
         "max_tiles": int(max_tiles) if max_tiles is not None else 200,
         "max_total_places": int(max_total_places) if max_total_places is not None else 3000,
-        # crawl options
         "max_pages_per_site": 20,
         "max_seconds_per_site": 30,
         "fast_mode": FAST_MODE_DEFAULT,
@@ -567,8 +594,9 @@ def start(n, api_key, mode, q, north, south, east, west, place_text, radius_km, 
         "paths_txt": "contact,about,team,staff",
     }
     threading.Thread(target=run_job, args=(args,), daemon=True).start()
-    return "Job started…"
+    return {"msg":"started", "ts": time.time()}
 
+# Download CSV
 @app.callback(
     Output("download","data"),
     Input("download-btn","n_clicks"),
@@ -578,10 +606,9 @@ def do_download(n):
     with job_lock:
         data = job["csv_bytes"]
     if not data:
-        return dash.no_update
-    # send in-memory bytes
+        return no_update
     return dcc.send_bytes(lambda b: b.write(data), "dental_clinics_with_emails.csv")
 
-# -------------- Entry --------------
+# Entry
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT","8050")), debug=False)
