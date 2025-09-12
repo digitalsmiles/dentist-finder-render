@@ -1,4 +1,3 @@
-# app.py
 import os, re, time, math, json, random, unicodedata, threading, io
 from urllib.parse import urljoin, urlparse
 from collections import deque
@@ -351,6 +350,17 @@ def set_job(**updates):
     with job_lock:
         job.update(updates)
 
+def is_job_running():
+    with job_lock:
+        return job.get("running", False)
+
+def reset_job():
+    with job_lock:
+        job.update({
+            "running": False, "progress": "Ready", "current": 0, "total": 0,
+            "rows": [], "csv_bytes": b"", "error": "", "diag": ""
+        })
+
 # ==========================
 # Dash app & layout
 # ==========================
@@ -505,7 +515,6 @@ def run_job(args):
                                "Emails found":"","First email source":"","Principal source":"",
                                "Place ID": futures[fut], "Error": f"{type(e).__name__}: {e}"}
 
-                    # Avoid totally empty rows
                     if row.get("Website") or row.get("Emails found") or row.get("Principal / Owner (guess)"):
                         rows_buffer.append(row)
 
@@ -525,7 +534,6 @@ def run_job(args):
         set_job(running=False, progress=f"Done. {len(df)} clinics.",
                 rows=df.to_dict("records"), csv_bytes=buf.read(), error="")
     except Exception as e:
-        # Surface any unexpected crash clearly in the UI
         set_job(running=False, error=f"Crash: {type(e).__name__}: {e}", progress="Stopped")
 
 # --------------------------
@@ -556,7 +564,7 @@ def poll_status(_):
     return status, diag, bar, info, rows
 
 # --------------------------
-# Start job
+# Start job (only one at a time)
 # --------------------------
 @app.callback(
     Output("kick","data"),
@@ -574,7 +582,10 @@ def start(n, place_text, radius_km, step_factor, max_tiles, max_total_places,
           max_pages_per_site, max_seconds_per_site):
     if not n:
         return no_update
-    # Immediately reflect starting state so UI cannot show Idle
+    if is_job_running():
+        set_job(diag="Job already running, wait for completion.", progress=job.get("progress", "Busy"))
+        return {"msg":"already_running", "ts": time.time()}
+    reset_job()
     set_job(running=True, progress="Starting…", current=0, total=0, rows=[], error="", diag="launching thread")
     args = {
         "place_text": place_text or "Brisbane QLD",
@@ -607,7 +618,6 @@ def do_download(n):
 # Entry
 # --------------------------
 if __name__ == "__main__":
-    # Helpful in logs to confirm env key presence
     print("GOOGLE_API_KEY set?" , bool(os.getenv("GOOGLE_API_KEY")))
     print("GMAPS_KEY set?"       , bool(os.getenv("GMAPS_KEY")))
     app.run(host="0.0.0.0", port=int(os.getenv("PORT","8050")), debug=False)
