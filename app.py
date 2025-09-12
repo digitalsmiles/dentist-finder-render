@@ -305,12 +305,7 @@ server = app.server
 app.layout = html.Div(
     style={"fontFamily":"system-ui,-apple-system,Segoe UI,Arial","maxWidth":"1100px","margin":"0 auto","padding":"18px"},
     children=[
-        html.H2("Dental Finder 🦷 — Dash (Region Sweep only)"),
-
-        # API key
-        html.Label("Google API key (optional if set as env var)"),
-        dcc.Input(id="api_key", placeholder="•••••••", type="password", style={"width":"420px"}),
-        html.Br(), html.Br(),
+        html.H2("Dental Finder"),
 
         # Place
         html.Label("Place (AU city / suburb / state / postcode)"),
