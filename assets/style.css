@@ -1,122 +1,204 @@
-/* ===== Base / layout ===== */
-:root {
-  --brand: #2563eb;         /* blue-600 */
-  --brand-600: #1e40af;     /* blue-800 */
-  --muted: #64748b;         /* slate-500 */
-  --border: #e2e8f0;        /* slate-200 */
-  --bg: #f8fafc;            /* slate-50 */
-  --card: #ffffff;
+/* ---------- Dark theme variables ---------- */
+:root{
+  --bg: #0f1115;
+  --panel: #161a22;
+  --panel-2:#1b2230;
+  --text: #e6e8ef;
+  --muted:#a8b3cf;
+  --accent:#5b8cff;      /* blue */
+  --accent-2:#22c55e;    /* green */
+  --danger:#ef4444;
+  --border:#232939;
+  --shadow: 0 10px 30px rgba(0,0,0,.35);
+
+  /* ⬇️ set your logo here: file path or full URL */
+  --logo-url: url("https://digitalsmiles.com.au/wp-content/uploads/2025/09/Neu-3.png");
 }
 
-html, body {
-  background: var(--bg);
-  color: #0f172a;           /* slate-900 */
-  font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-  font-size: 16px;
-  line-height: 1.4;
+/* ---------- Global ---------- */
+html, body{
+  background: var(--bg) !important;
+  color: var(--text) !important;
+  font-family: system-ui,-apple-system,Segoe UI,Arial,Helvetica,sans-serif;
 }
+a{ color: var(--accent); }
+*{ box-sizing: border-box; }
 
-h2 { margin: 12px 0 18px; letter-spacing: .2px; }
-
-#_dash-app-content > div {
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+/* Center the whole app column + max width */
+#react-entry-point, #_dash-app-content, body > div{
+  display: flex;
+  justify-content: center;
+}
+#_dash-app-content > div, body > div > div{
+  width: 100%;
+  max-width: 1100px;
   padding: 18px;
 }
 
-/* ===== Form elements ===== */
-label {
-  display: inline-block;
-  margin: 8px 0 6px;
-  color: var(--muted);
-  font-weight: 600;
-  font-size: 0.95rem;
+/* ---------- Header with centered logo ---------- */
+h2{
+  position: relative;
+  text-align: center;
+  font-weight: 650;
+  letter-spacing:.2px;
+  color: var(--text);
+  margin: 8px 0 18px;
+}
+h2::after{
+  content:"";
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  top: -70px;                /* push logo above the title */
+  width: 120px;
+  height: 120px;
+  background-image: var(--logo-url);
+  background-size: contain;
+  background-repeat: no-repeat;
+  background-position: center;
+  filter: drop-shadow(0 6px 16px rgba(0,0,0,.35));
 }
 
+/* ---------- Panels / cards feel ---------- */
+div, .dash-table-container{
+  /* subtle backgrounds only where it makes sense; overridden below */
+}
+.section{
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 14px;
+  box-shadow: var(--shadow);
+}
+
+/* ---------- Labels & helper text ---------- */
+label, .control-label{
+  display:block;
+  font-size: 13px;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+
+/* ---------- Inputs ---------- */
+/* Text + password inputs */
 input[type="text"],
-input[type="number"],
-input[type="password"] {
-  width: 100%;
-  max-width: 520px;
+input[type="password"]{
+  width: 60% !important;
+  background: var(--panel);
+  color: var(--text);
   border: 1px solid var(--border);
   border-radius: 10px;
-  padding: 8px 10px;
+  padding: 10px 12px;
   outline: none;
-  background: #fff;
-  transition: border-color .15s, box-shadow .15s;
+  transition: border-color .15s ease;
+  box-shadow: inset 0 0 0 rgba(0,0,0,0);
 }
-
 input[type="text"]:focus,
-input[type="number"]:focus,
-input[type="password"]:focus {
-  border-color: var(--brand);
-  box-shadow: 0 0 0 3px rgba(37, 99, 235, .15);
+input[type="password"]:focus{
+  border-color: var(--accent);
 }
 
-input::placeholder { color: #94a3b8; }
-
-/* compact the multi-input rows */
-div[style*="marginTop:8px"] > input {
-  margin-right: 8px;
-  max-width: 220px;
-}
-
-/* checkboxes */
-input[type="checkbox"] { accent-color: var(--brand); }
-
-/* ===== Buttons ===== */
-button, .dash-spreadsheet-container button {
-  border: none;
+/* Number inputs — shorter so they fit/overlap nicely in grids */
+input[type="number"]{
+  width: 130px !important;         /* <— shorter length as requested */
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
   border-radius: 10px;
-  padding: 8px 14px;
+  padding: 10px 12px;
+  outline: none;
+  transition: border-color .15s ease;
+}
+input[type="number"]:focus{
+  border-color: var(--accent);
+}
+
+/* Checklists (Fast mode / Only paths) */
+input[type="checkbox"]{
+  accent-color: var(--accent);
+  transform: scale(1.05);
+}
+label > .Select{
+  color: var(--text);
+}
+
+/* ---------- Button ---------- */
+button, .button{
+  background: linear-gradient(180deg, #6a96ff, #3a6cf0);
+  color: white;
+  border: 0;
+  border-radius: 12px;
+  padding: 10px 16px;
   font-weight: 600;
   cursor: pointer;
+  box-shadow: 0 8px 20px rgba(59, 130, 246, .25);
+  transition: transform .05s ease, filter .15s ease, box-shadow .15s ease;
 }
-
-#start {
-  background: var(--brand);
-  color: #fff;
-  transition: background-color .15s, transform .02s;
+button:hover{
+  filter: brightness(1.05);
+  box-shadow: 0 10px 22px rgba(59, 130, 246, .35);
 }
-#start:hover { background: var(--brand-600); }
-#start:active { transform: translateY(1px); }
+button:active{ transform: translateY(1px); }
 
-#download-btn { background: #0ea5e9; color: #fff; }
-#download-btn:hover { background: #0284c7; }
+/* Start/Download buttons by id if you want extra spacing */
+#start{ margin-right: 10px; }
 
-/* ===== Progress bar ===== */
-#progress-bar {
-  height: 12px !important;
-  background: #e5e7eb;      /* gray-200 */
-  border-radius: 999px;
+/* ---------- Status & progress ---------- */
+#status{
+  font-weight: 600;
+  color: var(--muted);
+}
+#progress-bar{
+  background: #0b0e14;
+  border-radius: 8px;
+  border: 1px solid var(--border);
   overflow: hidden;
-  border: 1px solid var(--border);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.02);
 }
-#progress-bar > div {
+#progress-bar > div{
+  background: linear-gradient(90deg, var(--accent), #7aa3ff);
   height: 100%;
-  background: linear-gradient(90deg, var(--brand), #22c55e);
-  transition: width .25s ease;
+}
+#progress-info{
+  color: var(--muted);
+  font-size: 13px;
 }
 
-/* ===== DataTable ===== */
-.dash-table-container .row { margin: 0; }
-.dash-table-container .dash-spreadsheet-container {
+/* ---------- DataTable dark mode ---------- */
+.dash-table-container{
+  background: var(--panel);
   border: 1px solid var(--border);
-  border-radius: 12px;
+  border-radius: 14px;
+  box-shadow: var(--shadow);
+  padding: 6px;
 }
-.dash-table-container .dash-header {
-  background: #f1f5f9 !important;   /* slate-100 */
-  font-weight: 700;
+
+.dash-spreadsheet-container .dash-spreadsheet-inner,
+.dash-spreadsheet{
+  background: var(--panel) !important;
+  color: var(--text) !important;
+  border: none !important;
 }
-.dash-table-container .dash-cell {
-  padding: 10px !important;
+
+.dash-table-container .dash-spreadsheet td,
+.dash-table-container .dash-spreadsheet th{
+  background-color: var(--panel) !important;
+  color: var(--text) !important;
   border-color: var(--border) !important;
 }
-.dash-table-container .dash-row:nth-child(even) .dash-cell {
-  background: #fafafa;
+
+.dash-spreadsheet tr:nth-child(even) td{
+  background: var(--panel-2) !important;
 }
 
-/* ===== Small text under progress ===== */
-#progress-info { color: var(--muted); font-size: .95rem; }
+.dash-table-container .previous-next-container, 
+.dash-table-container .dash-spreadsheet-menu{
+  color: var(--muted);
+}
+
+/* ---------- Grid niceties ---------- */
+/* Your layout already uses inline grid styles in app.py.
+   This just tightens spacing a bit so short number inputs look good. */
+[data-dash-is-loading="true"]{
+  opacity: .6;
+}
