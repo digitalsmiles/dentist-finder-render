@@ -1,5 +1,9 @@
-/* ---------- Dark theme variables ---------- */
-:root{
+/* =========================
+   Dark Theme + Stable Layout
+   ========================= */
+
+/* ----- Theme variables ----- */
+:root {
   --bg: #0f1115;
   --panel: #161a22;
   --panel-2:#1b2230;
@@ -11,59 +15,73 @@
   --border:#232939;
   --shadow: 0 10px 30px rgba(0,0,0,.35);
 
-  /* ⬇️ set your logo here: file path or full URL */
-  --logo-url: url("https://digitalsmiles.com.au/wp-content/uploads/2025/09/Neu-3.png");
+  /* 🔧 Logo settings */
+  --logo-url: url("/assets/logo.png");   /* change to any URL if you want */
+  --logo-size: 180px;                    /* bigger logo */
+  --title-gap: 40px;                     /* extra gap between logo & title */
 }
 
-/* ---------- Global ---------- */
-html, body{
+/* Always reserve scrollbar space to avoid left<->right jumping */
+html, body {
+  overflow-y: scroll;
+}
+
+/* Global colors/typography */
+html, body {
   background: var(--bg) !important;
   color: var(--text) !important;
   font-family: system-ui,-apple-system,Segoe UI,Arial,Helvetica,sans-serif;
 }
-a{ color: var(--accent); }
-*{ box-sizing: border-box; }
+a { color: var(--accent); }
+* { box-sizing: border-box; }
 
-/* Center the whole app column + max width */
-#react-entry-point, #_dash-app-content, body > div{
-  display: flex;
-  justify-content: center;
+/* Remove earlier global flex centers that can fight with Dash during updates */
+#react-entry-point,
+#_dash-app-content,
+body > div {
+  display: block !important;
+  justify-content: unset !important;
+  align-items: unset !important;
 }
-#_dash-app-content > div, body > div > div{
+
+/* One true centered wrapper (match the id you added in app.py) */
+#app-root {
   width: 100%;
   max-width: 1100px;
+  margin: 0 auto;       /* centers the app */
   padding: 18px;
 }
 
-/* ---------- Header with centered logo ---------- */
-h2{
+/* ---------- Header with big centered logo ---------- */
+h2 {
   position: relative;
   text-align: center;
   font-weight: 650;
-  letter-spacing:.2px;
+  letter-spacing: .2px;
   color: var(--text);
   margin: 8px 0 18px;
+  /* Add padding so the absolutely-positioned logo has room above the title */
+  padding-top: calc(var(--logo-size) + var(--title-gap));
 }
-h2::after{
-  content:"";
+
+h2::before {
+  content: "";
   position: absolute;
   left: 50%;
+  top: 0; /* sits inside the padding-top area */
   transform: translateX(-50%);
-  top: -70px;                /* push logo above the title */
-  width: 120px;
-  height: 120px;
+  width: var(--logo-size);
+  height: var(--logo-size);
   background-image: var(--logo-url);
   background-size: contain;
   background-repeat: no-repeat;
   background-position: center;
+  pointer-events: none;
   filter: drop-shadow(0 6px 16px rgba(0,0,0,.35));
 }
 
-/* ---------- Panels / cards feel ---------- */
-div, .dash-table-container{
-  /* subtle backgrounds only where it makes sense; overridden below */
-}
-.section{
+/* ---------- Panels / cards (optional utility) ---------- */
+.section {
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 14px;
@@ -71,9 +89,9 @@ div, .dash-table-container{
   box-shadow: var(--shadow);
 }
 
-/* ---------- Labels & helper text ---------- */
-label, .control-label{
-  display:block;
+/* ---------- Labels ---------- */
+label, .control-label {
+  display: block;
   font-size: 13px;
   color: var(--muted);
   margin-bottom: 6px;
@@ -82,7 +100,7 @@ label, .control-label{
 /* ---------- Inputs ---------- */
 /* Text + password inputs */
 input[type="text"],
-input[type="password"]{
+input[type="password"] {
   width: 60% !important;
   background: var(--panel);
   color: var(--text);
@@ -94,13 +112,13 @@ input[type="password"]{
   box-shadow: inset 0 0 0 rgba(0,0,0,0);
 }
 input[type="text"]:focus,
-input[type="password"]:focus{
+input[type="password"]:focus {
   border-color: var(--accent);
 }
 
-/* Number inputs — shorter so they fit/overlap nicely in grids */
-input[type="number"]{
-  width: 130px !important;         /* <— shorter length as requested */
+/* Number inputs — shorter width so they sit neatly side-by-side */
+input[type="number"] {
+  width: 130px !important;  /* shorter as requested */
   background: var(--panel);
   color: var(--text);
   border: 1px solid var(--border);
@@ -109,21 +127,18 @@ input[type="number"]{
   outline: none;
   transition: border-color .15s ease;
 }
-input[type="number"]:focus{
+input[type="number"]:focus {
   border-color: var(--accent);
 }
 
-/* Checklists (Fast mode / Only paths) */
-input[type="checkbox"]{
+/* Checklists */
+input[type="checkbox"] {
   accent-color: var(--accent);
   transform: scale(1.05);
 }
-label > .Select{
-  color: var(--text);
-}
 
-/* ---------- Button ---------- */
-button, .button{
+/* ---------- Buttons ---------- */
+button, .button {
   background: linear-gradient(180deg, #6a96ff, #3a6cf0);
   color: white;
   border: 0;
@@ -134,38 +149,41 @@ button, .button{
   box-shadow: 0 8px 20px rgba(59, 130, 246, .25);
   transition: transform .05s ease, filter .15s ease, box-shadow .15s ease;
 }
-button:hover{
+button:hover {
   filter: brightness(1.05);
   box-shadow: 0 10px 22px rgba(59, 130, 246, .35);
 }
-button:active{ transform: translateY(1px); }
+button:active { transform: translateY(1px); }
+#start { margin-right: 10px; } /* a bit of spacing before status text */
 
-/* Start/Download buttons by id if you want extra spacing */
-#start{ margin-right: 10px; }
-
-/* ---------- Status & progress ---------- */
-#status{
+/* ---------- Status & progress bar ---------- */
+#status {
   font-weight: 600;
   color: var(--muted);
 }
-#progress-bar{
+
+#progress-bar {
   background: #0b0e14;
-  border-radius: 8px;
   border: 1px solid var(--border);
+  border-radius: 8px;
   overflow: hidden;
+  min-height: 10px; /* stable height to avoid reflow */
   box-shadow: inset 0 1px 0 rgba(255,255,255,.02);
 }
-#progress-bar > div{
+#progress-bar > div {
   background: linear-gradient(90deg, var(--accent), #7aa3ff);
   height: 100%;
+  transition: width .25s ease;
+  will-change: width;
 }
-#progress-info{
+
+#progress-info {
   color: var(--muted);
   font-size: 13px;
 }
 
 /* ---------- DataTable dark mode ---------- */
-.dash-table-container{
+.dash-table-container {
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 14px;
@@ -174,31 +192,29 @@ button:active{ transform: translateY(1px); }
 }
 
 .dash-spreadsheet-container .dash-spreadsheet-inner,
-.dash-spreadsheet{
+.dash-spreadsheet {
   background: var(--panel) !important;
   color: var(--text) !important;
   border: none !important;
 }
 
 .dash-table-container .dash-spreadsheet td,
-.dash-table-container .dash-spreadsheet th{
+.dash-table-container .dash-spreadsheet th {
   background-color: var(--panel) !important;
   color: var(--text) !important;
   border-color: var(--border) !important;
 }
 
-.dash-spreadsheet tr:nth-child(even) td{
+.dash-spreadsheet tr:nth-child(even) td {
   background: var(--panel-2) !important;
 }
 
-.dash-table-container .previous-next-container, 
-.dash-table-container .dash-spreadsheet-menu{
+.dash-table-container .previous-next-container,
+.dash-table-container .dash-spreadsheet-menu {
   color: var(--muted);
 }
 
-/* ---------- Grid niceties ---------- */
-/* Your layout already uses inline grid styles in app.py.
-   This just tightens spacing a bit so short number inputs look good. */
-[data-dash-is-loading="true"]{
-  opacity: .6;
+/* ---------- Loading state optics ---------- */
+[data-dash-is-loading="true"] {
+  opacity: .85;
 }
