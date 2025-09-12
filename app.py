@@ -51,6 +51,18 @@ OBFUSCATED_EMAIL_RE = re.compile(
     re.I
 )
 
+# Roles we will accept as "principal / owner"
+ROLE_OK = [
+    "principal dentist", "practice owner", "owner",
+    "lead dentist", "clinical director", "principal"
+]
+# Roles we will explicitly exclude
+ROLE_BLOCK = [
+    "associate", "hygienist", "therapist", "oral health therapist",
+    "assistant", "reception", "practice manager", "coordinator",
+    "nurse", "specialist anaesthetist", "orthodontic therapist"
+]
+
 # ==========================
 # HTTP session with retry
 # ==========================
@@ -121,45 +133,167 @@ def http_get(url: str):
     return None, url
 
 # ==========================
-# Email / principal extraction
+# Email extraction
 # ==========================
 def extract_emails(soup: BeautifulSoup):
     found = set()
+    # strict mailto first
     for a in soup.select("a[href^='mailto:']"):
         addr = a.get("href","").split("mailto:")[-1].split("?")[0].strip()
         if EMAIL_RE.fullmatch(addr): found.add(addr.lower())
+
+    # visible text only
     text = soup.get_text(" ", strip=True)
     for m in EMAIL_RE.finditer(text):
-        found.add(m.group(0).lower())
+        e = m.group(0).lower()
+        # drop obvious file-like junk
+        if any(e.endswith(ext) for ext in [".jpg",".jpeg",".png",".gif",".svg",".webp"]):
+            continue
+        found.add(e)
+
+    # obfuscated forms like "info at domain dot com"
     for m in OBFUSCATED_EMAIL_RE.finditer(text):
         user, domain, tld = m.groups()
         addr = f"{user}@{domain}.{tld}".lower()
         if EMAIL_RE.fullmatch(addr): found.add(addr)
+
     return found
 
+# ==========================
+# Principal / owner extraction
+# ==========================
+NAME_RE = re.compile(r"^(?:Dr\.?\s*)?[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}$")
+DR_NAME_RE = re.compile(r"(Dr\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})")
+
+def norm_space(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
+
 def normalize_name(txt: str):
-    txt = re.sub(r"\s+"," ", txt).strip(" -:•|")
-    txt = re.sub(r"^(Dr\.?\s*)?", "Dr ", txt, flags=re.I).strip()
+    txt = norm_space(txt)
+    # ensure it begins with "Dr " if a title is present
+    if re.match(r"(?i)^dr\.?\s+", txt):
+        txt = re.sub(r"(?i)^dr\.?\s*", "Dr ", txt).strip()
     return txt
 
-def guess_principal(text: str):
-    t = re.sub(r"\s+"," ", text)
+def role_is_ok(role_text: str) -> bool:
+    t = role_text.lower()
+    if any(b in t for b in ROLE_BLOCK):
+        return False
+    return any(ok in t for ok in ROLE_OK)
+
+def nearby_text(node) -> str:
+    # collect text from node and small neighborhood
+    bits = [node.get_text(" ", strip=True)]
+    parent = node.parent
+    if parent:
+        bits.append(parent.get_text(" ", strip=True))
+        for sib in parent.find_all(recursive=False):
+            if sib is not node:
+                bits.append(sib.get_text(" ", strip=True))
+    return norm_space(" ".join(bits))
+
+def find_principal_in_structured_data(soup: BeautifulSoup):
+    # JSON-LD Person with jobTitle
+    for tag in soup.find_all("script", type=lambda t: t and "ld+json" in t):
+        try:
+            data = json.loads(tag.string or "")
+        except Exception:
+            continue
+        # normalize to list
+        items = data if isinstance(data, list) else [data]
+        for it in items:
+            if not isinstance(it, dict): continue
+            # handle @graph or single
+            graphs = it.get("@graph") if isinstance(it.get("@graph"), list) else [it]
+            for obj in graphs:
+                if not isinstance(obj, dict): continue
+                if obj.get("@type") in ("Person", ["Person"]):
+                    name = obj.get("name") or ""
+                    job = obj.get("jobTitle") or ""
+                    if name and job and role_is_ok(str(job)):
+                        m = DR_NAME_RE.search(name)
+                        if m:
+                            return normalize_name(m.group(1))
+                        # allow non Dr names if they clearly say owner
+                        if "owner" in str(job).lower():
+                            return normalize_name(name)
+    return ""
+
+def find_principal_on_team_like_pages(soup: BeautifulSoup):
+    # target obvious blocks first
+    candidates = []
+
+    # any element whose class hints at team or staff
+    team_like = soup.find_all(class_=lambda c: c and any(k in c.lower() for k in [
+        "team","staff","doctor","dentist","people","provider","bio","profile","member","card"
+    ]))
+    for block in team_like:
+        text = block.get_text(" ", strip=True)
+        # try to pick a name within the block
+        name = ""
+        m = DR_NAME_RE.search(text)
+        if m:
+            name = normalize_name(m.group(1))
+        else:
+            # sometimes name is in headings
+            for h in block.find_all(["h1","h2","h3","h4","strong","b"]):
+                ht = norm_space(h.get_text(" ", strip=True))
+                if DR_NAME_RE.search(ht):
+                    name = normalize_name(DR_NAME_RE.search(ht).group(1))
+                    break
+
+        if not name:
+            continue
+
+        # find role text near the name
+        vicinity = nearby_text(block)
+        if role_is_ok(vicinity):
+            candidates.append(name)
+
+    # headings and labels across the page
+    for h in soup.find_all(["h1","h2","h3","h4","strong","b","p","li","span"]):
+        t = norm_space(h.get_text(" ", strip=True))
+        m = DR_NAME_RE.search(t)
+        if not m:
+            continue
+        name = normalize_name(m.group(1))
+        if role_is_ok(t):
+            candidates.append(name)
+
+    # pick first stable candidate if any
+    return candidates[0] if candidates else ""
+
+def guess_principal_strict(soup: BeautifulSoup) -> str:
+    # 1) structured data first
+    name = find_principal_in_structured_data(soup)
+    if name:
+        return name
+    # 2) team-like layout with role labels
+    name = find_principal_on_team_like_pages(soup)
+    if name:
+        return name
+
+    # 3) text patterns like "Principal Dentist: Dr X", "Practice Owner Dr X"
+    text = soup.get_text(" ", strip=True)
+    # pattern with roles around the name
     pat1 = re.compile(
-        r"(Dr\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\s*(?:,|\s|-)?\s*"
-        r"(Principal\s+Dentist|Practice\s+Owner|Owner|Lead\s+Dentist|Clinical\s+Director)",
+        r"(Dr\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\s*[,|\-]?\s*(Principal\s+Dentist|Practice\s+Owner|Owner|Lead\s+Dentist|Clinical\s+Director)",
         re.I
     )
-    m = pat1.search(t)
-    if m: return normalize_name(m.group(1))
+    m = pat1.search(text)
+    if m:
+        return normalize_name(m.group(1))
+
     pat2 = re.compile(
-        r"(Principal\s+Dentist|Practice\s+Owner|Owner|Lead\s+Dentist|Clinical\s+Director)"
-        r"\s*[:\-]?\s*(Dr\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})",
+        r"(Principal\s+Dentist|Practice\s+Owner|Owner|Lead\s+Dentist|Clinical\s+Director)\s*[:\-]?\s*"
+        r"(Dr\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})",
         re.I
     )
-    m = pat2.search(t)
-    if m: return normalize_name(m.group(2))
-    m = re.search(r"(Dr\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})", t)
-    if m: return normalize_name(m.group(1))
+    m = pat2.search(text)
+    if m:
+        return normalize_name(m.group(2))
+
+    # Do NOT fall back to "any Dr" anymore
     return ""
 
 # ==========================
@@ -236,16 +370,19 @@ def crawl_site(site_url: str, max_pages: int, max_seconds: int, progress_cb=None
 
         soup = BeautifulSoup(html, "lxml")
 
+        # emails
         found = extract_emails(soup)
         for e in found:
             email_src.setdefault(e, final_url)
         emails |= found
 
+        # strict principal detection only when role is present
         if not principal:
-            g = guess_principal(soup.get_text(" ", strip=True))
+            g = guess_principal_strict(soup)
             if g:
                 principal, principal_src = g, final_url
 
+        # follow internal links
         internal = []
         for a in soup.find_all("a", href=True):
             u = normalize_abs(final_url, a["href"])
