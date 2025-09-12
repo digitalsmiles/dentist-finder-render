@@ -14,19 +14,14 @@ from urllib3.util.retry import Retry
 from dash import Dash, html, dcc, Input, Output, State, dash_table, no_update
 
 # ==========================
-# Environment key (hide input if present)
-# ==========================
-ENV_API_KEY = (os.getenv("GOOGLE_API_KEY") or os.getenv("GMAPS_KEY") or "").strip()
-
-# ==========================
 # Tunables
 # ==========================
 CONNECT_TIMEOUT = 5
 READ_TIMEOUT = 25
 TIMEOUT = (CONNECT_TIMEOUT, READ_TIMEOUT)
-PLACE_TIMEOUT = 120               # hard cap per clinic (details + crawl)
+PLACE_TIMEOUT = 120
 RETRIES = 3
-CRAWL_SLEEP = 0.35                # polite pause between page fetches
+CRAWL_SLEEP = 0.35
 NEARBY_SLEEP = 2.1
 JITTER = 0.25
 MAX_HTML_BYTES = 1_800_000
@@ -41,7 +36,6 @@ HEADERS = {
                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 }
 
-# Visit-order hints only (NOT filtering)
 LIKELY_PATH_HINTS = [
     "contact","contact-us","book","appointments",
     "about","about-us","our-team","team","meet-the-team",
@@ -49,8 +43,6 @@ LIKELY_PATH_HINTS = [
 ]
 
 EMAIL_RE = re.compile(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", re.I)
-
-# Obfuscation patterns: "name [at] domain dot com"
 AT_VARIANTS = r"(?:@|\s?[\[\(]{0,1}\s*at\s*[\]\)]{0,1}\s?)"
 DOT_VARIANTS = r"(?:\.|\s?dot\s?)"
 OBFUSCATED_EMAIL_RE = re.compile(
@@ -89,7 +81,6 @@ def same_site(a, b):
     return (ua.scheme, ua.netloc) == (ub.scheme, ub.netloc)
 
 def normalize_abs(base, href):
-    """Resolve href to absolute clean URL, strip fragments, skip binaries/mailto/tel."""
     if not href: return None
     href = href.strip()
     if href.startswith(("#","mailto:","tel:")): return None
@@ -126,24 +117,19 @@ def http_get(url: str):
     return None, url
 
 # ==========================
-# Email / principal extraction
+# Extraction
 # ==========================
 def extract_emails(soup: BeautifulSoup):
     found = set()
-    # mailto
     for a in soup.select("a[href^='mailto:']"):
         addr = a.get("href","").split("mailto:")[-1].split("?")[0].strip()
         if EMAIL_RE.fullmatch(addr): found.add(addr.lower())
-    # direct
     text = soup.get_text(" ", strip=True)
-    for m in EMAIL_RE.finditer(text):
-        found.add(m.group(0).lower())
-    # obfuscated
+    for m in EMAIL_RE.finditer(text): found.add(m.group(0).lower())
     for m in OBFUSCATED_EMAIL_RE.finditer(text):
         user, domain, tld = m.groups()
         addr = f"{user}@{domain}.{tld}".lower()
-        if EMAIL_RE.fullmatch(addr):
-            found.add(addr)
+        if EMAIL_RE.fullmatch(addr): found.add(addr)
     return found
 
 def normalize_name(txt: str):
@@ -175,7 +161,6 @@ def guess_principal(text: str):
 # Crawl helpers
 # ==========================
 def prioritise(urls):
-    """Only reorder so likely pages are visited earlier."""
     def score(u):
         path = urlparse(u).path.lower().strip("/")
         return 0 if any(tok in path for tok in LIKELY_PATH_HINTS) else 1
@@ -200,8 +185,7 @@ def parse_sitemap(url):
         xml, _ = http_get(url)
         if not xml: return []
         soup = BeautifulSoup(xml, "xml")
-        locs = [loc.get_text(strip=True) for loc in soup.find_all("loc")]
-        return [l for l in locs if l]
+        return [loc.get_text(strip=True) for loc in soup.find_all("loc") if loc.get_text(strip=True)]
     except Exception:
         return []
 
@@ -214,10 +198,10 @@ def sitemap_seed(base_url):
     except Exception:
         pass
     seeds = [u for u in seeds if same_site(base_url, u)]
-    return prioritise(seeds)[:1000]  # soft cap
+    return prioritise(seeds)[:1000]
 
 # ==========================
-# Full-site crawler (bounded by caps)
+# Full-site crawler
 # ==========================
 def crawl_site(site_url: str, max_pages: int, max_seconds: int, progress_cb=None):
     t0 = time.time()
@@ -233,7 +217,6 @@ def crawl_site(site_url: str, max_pages: int, max_seconds: int, progress_cb=None
 
     principal, principal_src = "", canon
     emails, email_src = set(), {}
-
     pages_scanned = 0
 
     while queue and pages_scanned < max_pages and (time.time() - t0) < max_seconds:
@@ -242,24 +225,20 @@ def crawl_site(site_url: str, max_pages: int, max_seconds: int, progress_cb=None
 
         html, final_url = http_get(url)
         if not html:
-            if progress_cb: progress_cb(pages_scanned, max_pages)
-            continue
+            if progress_cb: progress_cb(pages_scanned, max_pages); continue
 
         soup = BeautifulSoup(html, "lxml")
 
-        # Emails
         found = extract_emails(soup)
         for e in found:
             email_src.setdefault(e, final_url)
         emails |= found
 
-        # Principal / owner
         if not principal:
             g = guess_principal(soup.get_text(" ", strip=True))
             if g:
                 principal, principal_src = g, final_url
 
-        # Discover internal links (no filtering)
         internal = []
         for a in soup.find_all("a", href=True):
             u = normalize_abs(final_url, a["href"])
@@ -331,8 +310,7 @@ def geocode_viewport(gmaps_client, place_text: str):
     g = None
     for attempt in range(RETRIES + 1):
         try:
-            g = gmaps_client.geocode(place_text, region="au")
-            break
+            g = gmaps_client.geocode(place_text, region="au"); break
         except Exception:
             time.sleep(0.6 * (2 ** attempt) + random.random() * JITTER)
     if not g: return None
@@ -364,26 +342,16 @@ def set_job(**updates):
         job.update(updates)
 
 # ==========================
-# Dash app & layout (Region Sweep only)
+# Dash app & layout (AUTO FULL-REGION SWEEP)
 # ==========================
 app = Dash(__name__, title="Dental Finder (Dash)", suppress_callback_exceptions=True)
 server = app.server
-
-# Always include the api_key input, but hide it if ENV key is present
-api_key_block = html.Div([
-    html.Label("Google API key (only shown because no env var found)"),
-    dcc.Input(id="api_key", type="password", style={"width":"420px"}),
-    html.Div("Tip: set GMAPS_KEY or GOOGLE_API_KEY as an environment variable to hide this field.",
-             style={"fontSize":"12px","opacity":0.8,"marginTop":"4px"})
-], style={"display":"none" if ENV_API_KEY else "block"})
 
 app.layout = html.Div(
     id="app-root",
     style={"fontFamily":"system-ui,-apple-system,Segoe UI,Arial","maxWidth":"1100px","margin":"0 auto","padding":"18px"},
     children=[
-        html.H2("Dental Finder"),
-
-        api_key_block,
+        html.H2("Dental Finder 🦷"),
 
         html.Label("Place (AU city / suburb / state / postcode)"),
         dcc.Input(id="place_text", value="Brisbane QLD", style={"width":"60%"}),
@@ -398,25 +366,18 @@ app.layout = html.Div(
                 dcc.Input(id="step_factor", type="number", value=1.5, step=0.1),
             ]),
             html.Div([
-                html.Label("Max tiles (center-out)"),
-                dcc.Input(id="max_tiles", type="number", value=200, step=10),
-            ]),
-            html.Div([
-                html.Label("Max clinics to collect"),
+                html.Label("Max clinics to collect (cap)"),
                 dcc.Input(id="max_total_places", type="number", value=3000, step=100),
             ]),
-        ], style={"marginTop":"8px","display":"grid","gridTemplateColumns":"repeat(4, minmax(180px,1fr))","gap":"10px"}),
-
-        html.Div([
             html.Div([
-                html.Label("Max pages per site (crawl deeper = higher)"),
+                html.Label("Max pages per site"),
                 dcc.Input(id="max_pages_per_site", type="number", value=80, step=5),
             ]),
             html.Div([
                 html.Label("Max seconds per site"),
                 dcc.Input(id="max_seconds_per_site", type="number", value=90, step=5),
             ]),
-        ], style={"marginTop":"8px","display":"grid","gridTemplateColumns":"repeat(2, minmax(220px,1fr))","gap":"10px"}),
+        ], style={"marginTop":"8px","display":"grid","gridTemplateColumns":"repeat(5, minmax(160px,1fr))","gap":"10px"}),
 
         html.Br(),
         html.Button("Start sweep", id="start", n_clicks=0, style={"padding":"8px 14px"}),
@@ -443,115 +404,111 @@ app.layout = html.Div(
 )
 
 # --------------------------
-# Job runner (region only)
+# Job runner (auto full-region)
 # --------------------------
 def run_job(args):
     set_job(running=True, progress="Starting…", current=0, total=0, rows=[], csv_bytes=b"", error="")
-    try:
-        api_key = (args.get("api_key") or ENV_API_KEY).strip()
-        if not api_key:
-            set_job(running=False, error="No Google API key found (set GMAPS_KEY or GOOGLE_API_KEY).")
-            return
 
-        gmaps_client = googlemaps.Client(key=api_key)
+    api_key = (os.getenv("GOOGLE_API_KEY") or os.getenv("GMAPS_KEY") or "").strip()
+    if not api_key:
+        set_job(running=False, error="No API key provided (set GOOGLE_API_KEY or GMAPS_KEY)."); return
 
-        vp = geocode_viewport(gmaps_client, args["place_text"])
-        if not vp:
-            set_job(running=False, error="Could not geocode that place.")
-            return
-        north, south, east, west = vp
+    gmaps_client = googlemaps.Client(key=api_key)
 
-        radius_km, step_factor = args["radius_km"], args["step_factor"]
-        max_tiles, max_total_places = args["max_tiles"], args["max_total_places"]
+    vp = geocode_viewport(gmaps_client, args["place_text"])
+    if not vp:
+        set_job(running=False, error="Could not geocode that place."); return
+    north, south, east, west = vp
 
-        centers_all = list(make_grid(north, south, east, west, radius_km, step_factor))
-        center_lat = (north + south)/2.0; center_lon = (east + west)/2.0
-        centers_sorted = sort_center_out(centers_all, center_lat, center_lon)
-        centers = centers_sorted[:max_tiles] if len(centers_sorted) > max_tiles else centers_sorted
+    radius_km, step_factor = args["radius_km"], args["step_factor"]
+    max_total_places = args["max_total_places"]
 
-        place_ids = {}
-        for i, (lat, lon) in enumerate(centers, start=1):
-            set_job(progress=f"Discovery {i}/{len(centers)} tiles…")
-            nearby = fetch_nearby_all_pages(gmaps_client, (lat, lon), int(radius_km*1000), type_="dentist")
-            for pl in nearby:
-                pid = pl.get("place_id")
-                if pid and pid not in place_ids:
-                    place_ids[pid] = pl
-                    if len(place_ids) >= max_total_places: break
-            if len(place_ids) >= max_total_places: break
+    # Build full grid that fits the region
+    centers_all = list(make_grid(north, south, east, west, radius_km, step_factor))
+    center_lat = (north + south)/2.0; center_lon = (east + west)/2.0
+    centers = sort_center_out(centers_all, center_lat, center_lon)
 
-        if not place_ids:
-            set_job(running=False, error="No clinics found.")
-            return
+    # Show discovery progress over the *full* region
+    set_job(progress=f"Discovery 0/{len(centers)} tiles…", current=0, total=len(centers))
 
-        ids = list(place_ids.keys())
-        rows_buffer = []
-        set_job(progress="Scraping details…", current=0, total=len(ids))
+    place_ids = {}
+    for i, (lat, lon) in enumerate(centers, start=1):
+        nearby = fetch_nearby_all_pages(gmaps_client, (lat, lon), int(radius_km*1000), type_="dentist")
+        for pl in nearby:
+            pid = pl.get("place_id")
+            if pid and pid not in place_ids:
+                place_ids[pid] = pl
+                if len(place_ids) >= max_total_places:
+                    break
+        set_job(progress=f"Discovery {i}/{len(centers)} tiles…", current=i, total=len(centers))
+        if len(place_ids) >= max_total_places:
+            break
 
-        def worker(pid):
-            det = gmaps_place_details(gmaps_client, pid)
-            r = det.get("result", {})
-            practice = r.get("name"); addr = r.get("formatted_address")
-            site = (r.get("website") or "").strip()
+    if not place_ids:
+        set_job(running=False, error="No clinics found in region."); return
 
-            principal, emails, email_src, principal_src = ("", set(), "", "")
-            if site:
-                principal, emails, email_src, principal_src = crawl_site(
-                    site,
-                    max_pages=args["max_pages_per_site"],
-                    max_seconds=args["max_seconds_per_site"],
-                    progress_cb=None
-                )
+    ids = list(place_ids.keys())
 
-            row = {
-                "Practice": practice or "", "Address": addr or "", "Website": site,
-                "Principal / Owner (guess)": principal,
-                "Emails found": ", ".join(sorted(emails)) if emails else "",
-                "First email source": email_src, "Principal source": principal_src or site,
-                "Place ID": pid
-            }
-            return row
+    # Switch progress to scraping phase
+    set_job(progress="Scraping details…", current=0, total=len(ids))
 
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-            idx = 0
-            while idx < len(ids):
-                batch = ids[idx: min(idx + MAX_WORKERS, len(ids))]
-                futures = {pool.submit(worker, pid): pid for pid in batch}
-                for fut in futures:
-                    try:
-                        row = fut.result(timeout=PLACE_TIMEOUT)
-                    except FuturesTimeout:
-                        row = {"Practice":"","Address":"","Website":"","Principal / Owner (guess)":"",
-                               "Emails found":"","First email source":"","Principal source":"",
-                               "Place ID": futures[fut], "Error": f"Timeout after {PLACE_TIMEOUT}s"}
-                    except Exception as e:
-                        row = {"Practice":"","Address":"","Website":"","Principal / Owner (guess)":"",
-                               "Emails found":"","First email source":"","Principal source":"",
-                               "Place ID": futures[fut], "Error": str(e)}
+    rows_buffer = []
 
-                    # Skip totally empty rows (no site and nothing found)
-                    if not (row.get("Website") or row.get("Emails found") or row.get("Principal / Owner (guess)")):
-                        pass
-                    else:
-                        rows_buffer.append(row)
+    def worker(pid):
+        det = gmaps_place_details(gmaps_client, pid)
+        r = det.get("result", {})
+        practice = r.get("name"); addr = r.get("formatted_address")
+        site = (r.get("website") or "").strip()
 
-                    with job_lock:
-                        job["current"] += 1
-                idx += len(batch)
-                set_job(progress=f"Scraping {job['current']}/{len(ids)}…")
+        principal, emails, email_src, principal_src = ("", set(), "", "")
+        if site:
+            principal, emails, email_src, principal_src = crawl_site(
+                site, max_pages=args["max_pages_per_site"], max_seconds=args["max_seconds_per_site"], progress_cb=None
+            )
 
-        df = pd.DataFrame(rows_buffer)
-        if "Place ID" in df.columns:
-            df = df.drop_duplicates(subset=["Place ID"]).reset_index(drop=True)
+        return {
+            "Practice": practice or "", "Address": addr or "", "Website": site,
+            "Principal / Owner (guess)": principal,
+            "Emails found": ", ".join(sorted(emails)) if emails else "",
+            "First email source": email_src, "Principal source": principal_src or site,
+            "Place ID": pid
+        }
 
-        buf = io.BytesIO()
-        df.to_csv(buf, index=False); buf.seek(0)
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        idx = 0
+        while idx < len(ids):
+            batch = ids[idx: min(idx + MAX_WORKERS, len(ids))]
+            futures = {pool.submit(worker, pid): pid for pid in batch}
+            for fut in futures:
+                try:
+                    row = fut.result(timeout=PLACE_TIMEOUT)
+                except FuturesTimeout:
+                    row = {"Practice":"","Address":"","Website":"","Principal / Owner (guess)":"",
+                           "Emails found":"","First email source":"","Principal source":"",
+                           "Place ID": futures[fut], "Error": f"Timeout after {PLACE_TIMEOUT}s"}
+                except Exception as e:
+                    row = {"Practice":"","Address":"","Website":"","Principal / Owner (guess)":"",
+                           "Emails found":"","First email source":"","Principal source":"",
+                           "Place ID": futures[fut], "Error": str(e)}
 
-        set_job(running=False, progress=f"Done. {len(df)} clinics.", rows=df.to_dict("records"),
-                csv_bytes=buf.read(), error="", total=len(ids))
+                # keep row even if sparse; duplicates removed later by Place ID
+                rows_buffer.append(row)
 
-    except Exception as e:
-        set_job(running=False, error=f"Crash: {e}")
+                with job_lock:
+                    job["current"] += 1
+                    cur = job["current"]
+            idx += len(batch)
+            set_job(progress=f"Scraping {job['current']}/{len(ids)}…", total=len(ids))
+
+    df = pd.DataFrame(rows_buffer)
+    if "Place ID" in df.columns:
+        df = df.drop_duplicates(subset=["Place ID"]).reset_index(drop=True)
+
+    buf = io.BytesIO()
+    df.to_csv(buf, index=False); buf.seek(0)
+
+    set_job(running=False, progress=f"Done. {len(df)} clinics.", rows=df.to_dict("records"),
+            csv_bytes=buf.read(), error="", total=len(ids))
 
 # --------------------------
 # Poll UI for progress
@@ -581,22 +538,20 @@ def poll_status(_):
     return status, bar, info, rows
 
 # --------------------------
-# Start job
+# Start job (no API field; uses env var)
 # --------------------------
 @app.callback(
     Output("kick","data"),
     Input("start","n_clicks"),
-    State("api_key","value"),
     State("place_text","value"),
     State("radius_km","value"),
     State("step_factor","value"),
-    State("max_tiles","value"),
     State("max_total_places","value"),
     State("max_pages_per_site","value"),
     State("max_seconds_per_site","value"),
     prevent_initial_call=True
 )
-def start(n, api_key, place_text, radius_km, step_factor, max_tiles, max_total_places,
+def start(n, place_text, radius_km, step_factor, max_total_places,
           max_pages_per_site, max_seconds_per_site):
     if not n:
         return no_update
@@ -604,11 +559,9 @@ def start(n, api_key, place_text, radius_km, step_factor, max_tiles, max_total_p
         return {"msg":"already running"}
 
     args = {
-        "api_key": (api_key or ENV_API_KEY).strip(),   # fallback to env if UI empty/hidden
         "place_text": place_text or "Brisbane QLD",
         "radius_km": float(radius_km) if radius_km is not None else 2.5,
         "step_factor": float(step_factor) if step_factor is not None else 1.5,
-        "max_tiles": int(max_tiles) if max_tiles is not None else 200,
         "max_total_places": int(max_total_places) if max_total_places is not None else 3000,
         "max_pages_per_site": int(max_pages_per_site) if max_pages_per_site is not None else 80,
         "max_seconds_per_site": int(max_seconds_per_site) if max_seconds_per_site is not None else 90,
