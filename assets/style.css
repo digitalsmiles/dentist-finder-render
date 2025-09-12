@@ -17,8 +17,8 @@
 
   /* 🔧 Logo settings */
   --logo-url: url("https://digitalsmiles.com.au/wp-content/uploads/2025/09/Neu-3.png");   /* change to any URL if you want */
-  --logo-size: 180px;                    /* bigger logo */
-  --title-gap: 40px;                     /* extra gap between logo & title */
+  --logo-size: 240px;                    /* bigger logo */
+  --title-gap: 20px;                     /* extra gap between logo & title */
 }
 
 /* Always reserve scrollbar space to avoid left<->right jumping */
