@@ -327,7 +327,11 @@ def set_job(**updates):
 # ==========================
 # Dash app & layout
 # ==========================
-app = Dash(__name__, title="Dental Finder (Dash)")
+app = Dash(
+    __name__,
+    title="Dental Finder (Dash)",
+    suppress_callback_exceptions=True,   # allow components that appear later
+)
 server = app.server
 
 app.layout = html.Div(
