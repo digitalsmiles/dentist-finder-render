@@ -1,0 +1,122 @@
+/* ===== Base / layout ===== */
+:root {
+  --brand: #2563eb;         /* blue-600 */
+  --brand-600: #1e40af;     /* blue-800 */
+  --muted: #64748b;         /* slate-500 */
+  --border: #e2e8f0;        /* slate-200 */
+  --bg: #f8fafc;            /* slate-50 */
+  --card: #ffffff;
+}
+
+html, body {
+  background: var(--bg);
+  color: #0f172a;           /* slate-900 */
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.4;
+}
+
+h2 { margin: 12px 0 18px; letter-spacing: .2px; }
+
+#_dash-app-content > div {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+  padding: 18px;
+}
+
+/* ===== Form elements ===== */
+label {
+  display: inline-block;
+  margin: 8px 0 6px;
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 0.95rem;
+}
+
+input[type="text"],
+input[type="number"],
+input[type="password"] {
+  width: 100%;
+  max-width: 520px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px 10px;
+  outline: none;
+  background: #fff;
+  transition: border-color .15s, box-shadow .15s;
+}
+
+input[type="text"]:focus,
+input[type="number"]:focus,
+input[type="password"]:focus {
+  border-color: var(--brand);
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, .15);
+}
+
+input::placeholder { color: #94a3b8; }
+
+/* compact the multi-input rows */
+div[style*="marginTop:8px"] > input {
+  margin-right: 8px;
+  max-width: 220px;
+}
+
+/* checkboxes */
+input[type="checkbox"] { accent-color: var(--brand); }
+
+/* ===== Buttons ===== */
+button, .dash-spreadsheet-container button {
+  border: none;
+  border-radius: 10px;
+  padding: 8px 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+#start {
+  background: var(--brand);
+  color: #fff;
+  transition: background-color .15s, transform .02s;
+}
+#start:hover { background: var(--brand-600); }
+#start:active { transform: translateY(1px); }
+
+#download-btn { background: #0ea5e9; color: #fff; }
+#download-btn:hover { background: #0284c7; }
+
+/* ===== Progress bar ===== */
+#progress-bar {
+  height: 12px !important;
+  background: #e5e7eb;      /* gray-200 */
+  border-radius: 999px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+}
+#progress-bar > div {
+  height: 100%;
+  background: linear-gradient(90deg, var(--brand), #22c55e);
+  transition: width .25s ease;
+}
+
+/* ===== DataTable ===== */
+.dash-table-container .row { margin: 0; }
+.dash-table-container .dash-spreadsheet-container {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+.dash-table-container .dash-header {
+  background: #f1f5f9 !important;   /* slate-100 */
+  font-weight: 700;
+}
+.dash-table-container .dash-cell {
+  padding: 10px !important;
+  border-color: var(--border) !important;
+}
+.dash-table-container .dash-row:nth-child(even) .dash-cell {
+  background: #fafafa;
+}
+
+/* ===== Small text under progress ===== */
+#progress-info { color: var(--muted); font-size: .95rem; }
