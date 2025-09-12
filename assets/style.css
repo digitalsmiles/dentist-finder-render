@@ -16,7 +16,7 @@
   --shadow: 0 10px 30px rgba(0,0,0,.35);
 
   /* 🔧 Logo settings */
-  --logo-url: url("/assets/logo.png");   /* change to any URL if you want */
+  --logo-url: url("https://digitalsmiles.com.au/wp-content/uploads/2025/09/Neu-3.png");   /* change to any URL if you want */
   --logo-size: 180px;                    /* bigger logo */
   --title-gap: 40px;                     /* extra gap between logo & title */
 }
