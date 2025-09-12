@@ -1,0 +1,8 @@
+dash
+flask
+requests
+pandas
+beautifulsoup4
+lxml
+plotly
+gunicorn
