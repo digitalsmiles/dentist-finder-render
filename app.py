@@ -1,5 +1,5 @@
 # app.py
-import os, re, time, math, json, random, unicodedata, threading, io
+import os, re, time, math, json, random, unicodedata, threading, io, traceback, sys
 from urllib.parse import urljoin, urlparse
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
@@ -14,18 +14,19 @@ from urllib3.util.retry import Retry
 from dash import Dash, html, dcc, Input, Output, State, dash_table, no_update
 
 # ==========================
-# Tunables
+# Tunables & constants
 # ==========================
 CONNECT_TIMEOUT = 5
 READ_TIMEOUT = 25
 TIMEOUT = (CONNECT_TIMEOUT, READ_TIMEOUT)
-PLACE_TIMEOUT = 120
+PLACE_TIMEOUT = 150                # hard cap per place
 RETRIES = 3
-CRAWL_SLEEP = 0.35
+CRAWL_SLEEP = 0.35                 # polite pause between page fetches
 NEARBY_SLEEP = 2.1
 JITTER = 0.25
 MAX_HTML_BYTES = 1_800_000
-MAX_WORKERS = 4
+MAX_WORKERS = 2                    # smaller = fewer memory spikes, fewer crashes on small instances
+FLUSH_EVERY = 12                   # append to CSV every N processed clinics
 
 BINARY_EXTS = (".pdf",".doc",".docx",".xls",".xlsx",".ppt",".pptx",".zip",".rar",
                ".png",".jpg",".jpeg",".gif",".svg",".webp",".mp4",".avi",".mov",".wmv",
@@ -36,6 +37,7 @@ HEADERS = {
                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 }
 
+# Only used to order visits earlier (we still crawl everything)
 LIKELY_PATH_HINTS = [
     "contact","contact-us","book","appointments",
     "about","about-us","our-team","team","meet-the-team",
@@ -71,6 +73,9 @@ SESSION = make_session()
 # ==========================
 # Utils
 # ==========================
+def log(*args):
+    print(*args, file=sys.stdout, flush=True)
+
 def slugify(s: str):
     s = unicodedata.normalize("NFKD", s).encode("ascii","ignore").decode("ascii")
     s = re.sub(r"[^A-Za-z0-9]+","_", s).strip("_")
@@ -117,19 +122,23 @@ def http_get(url: str):
     return None, url
 
 # ==========================
-# Extraction
+# Email / principal extraction
 # ==========================
 def extract_emails(soup: BeautifulSoup):
     found = set()
     for a in soup.select("a[href^='mailto:']"):
         addr = a.get("href","").split("mailto:")[-1].split("?")[0].strip()
         if EMAIL_RE.fullmatch(addr): found.add(addr.lower())
+
     text = soup.get_text(" ", strip=True)
-    for m in EMAIL_RE.finditer(text): found.add(m.group(0).lower())
+    for m in EMAIL_RE.finditer(text):
+        found.add(m.group(0).lower())
+
     for m in OBFUSCATED_EMAIL_RE.finditer(text):
         user, domain, tld = m.groups()
         addr = f"{user}@{domain}.{tld}".lower()
-        if EMAIL_RE.fullmatch(addr): found.add(addr)
+        if EMAIL_RE.fullmatch(addr):
+            found.add(addr)
     return found
 
 def normalize_name(txt: str):
@@ -158,7 +167,7 @@ def guess_principal(text: str):
     return ""
 
 # ==========================
-# Crawl helpers
+# Crawl helpers (visit ordering only)
 # ==========================
 def prioritise(urls):
     def score(u):
@@ -185,7 +194,8 @@ def parse_sitemap(url):
         xml, _ = http_get(url)
         if not xml: return []
         soup = BeautifulSoup(xml, "xml")
-        return [loc.get_text(strip=True) for loc in soup.find_all("loc") if loc.get_text(strip=True)]
+        locs = [loc.get_text(strip=True) for loc in soup.find_all("loc")]
+        return [l for l in locs if l]
     except Exception:
         return []
 
@@ -198,10 +208,10 @@ def sitemap_seed(base_url):
     except Exception:
         pass
     seeds = [u for u in seeds if same_site(base_url, u)]
-    return prioritise(seeds)[:1000]
+    return prioritise(seeds)[:2000]
 
 # ==========================
-# Full-site crawler
+# Full-site crawler (bounded)
 # ==========================
 def crawl_site(site_url: str, max_pages: int, max_seconds: int, progress_cb=None):
     t0 = time.time()
@@ -225,7 +235,8 @@ def crawl_site(site_url: str, max_pages: int, max_seconds: int, progress_cb=None
 
         html, final_url = http_get(url)
         if not html:
-            if progress_cb: progress_cb(pages_scanned, max_pages); continue
+            if progress_cb: progress_cb(pages_scanned, max_pages)
+            continue
 
         soup = BeautifulSoup(html, "lxml")
 
@@ -310,7 +321,8 @@ def geocode_viewport(gmaps_client, place_text: str):
     g = None
     for attempt in range(RETRIES + 1):
         try:
-            g = gmaps_client.geocode(place_text, region="au"); break
+            g = gmaps_client.geocode(place_text, region="au")
+            break
         except Exception:
             time.sleep(0.6 * (2 ** attempt) + random.random() * JITTER)
     if not g: return None
@@ -331,6 +343,38 @@ def geocode_viewport(gmaps_client, place_text: str):
     return lat + dlat, lat - dlat, lng + dlon, lng - dlon
 
 # ==========================
+# Persistence (checkpoint & CSV)
+# ==========================
+def load_checkpoint(path):
+    try:
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {"done_ids": []}
+
+def save_checkpoint(path, done_ids):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"done_ids": list(done_ids)}, f)
+    os.replace(tmp, path)
+
+def append_rows_csv(path, rows):
+    if not rows: return
+    header = not os.path.exists(path)
+    df = pd.DataFrame(rows)
+    df.to_csv(path, mode="a", header=header, index=False)
+
+def load_csv_if_any(path):
+    if os.path.exists(path):
+        try:
+            return pd.read_csv(path)
+        except Exception:
+            return pd.DataFrame()
+    return pd.DataFrame()
+
+# ==========================
 # Background job state
 # ==========================
 job = {"running": False, "progress": "Idle", "current": 0, "total": 0,
@@ -342,7 +386,7 @@ def set_job(**updates):
         job.update(updates)
 
 # ==========================
-# Dash app & layout (AUTO FULL-REGION SWEEP)
+# Dash app & layout (Region Sweep only, no API field)
 # ==========================
 app = Dash(__name__, title="Dental Finder (Dash)", suppress_callback_exceptions=True)
 server = app.server
@@ -366,18 +410,25 @@ app.layout = html.Div(
                 dcc.Input(id="step_factor", type="number", value=1.5, step=0.1),
             ]),
             html.Div([
-                html.Label("Max clinics to collect (cap)"),
-                dcc.Input(id="max_total_places", type="number", value=3000, step=100),
+                html.Label("Max tiles (center-out)"),
+                dcc.Input(id="max_tiles", type="number", value=200, step=10),
             ]),
             html.Div([
-                html.Label("Max pages per site"),
+                html.Label("Max clinics to collect"),
+                dcc.Input(id="max_total_places", type="number", value=3000, step=100),
+            ]),
+        ], style={"marginTop":"8px","display":"grid","gridTemplateColumns":"repeat(4, minmax(180px,1fr))","gap":"10px"}),
+
+        html.Div([
+            html.Div([
+                html.Label("Max pages per site (crawl deeper = higher)"),
                 dcc.Input(id="max_pages_per_site", type="number", value=80, step=5),
             ]),
             html.Div([
                 html.Label("Max seconds per site"),
                 dcc.Input(id="max_seconds_per_site", type="number", value=90, step=5),
             ]),
-        ], style={"marginTop":"8px","display":"grid","gridTemplateColumns":"repeat(5, minmax(160px,1fr))","gap":"10px"}),
+        ], style={"marginTop":"8px","display":"grid","gridTemplateColumns":"repeat(2, minmax(220px,1fr))","gap":"10px"}),
 
         html.Br(),
         html.Button("Start sweep", id="start", n_clicks=0, style={"padding":"8px 14px"}),
@@ -404,111 +455,149 @@ app.layout = html.Div(
 )
 
 # --------------------------
-# Job runner (auto full-region)
+# Job runner (with crash guard + checkpoint/resume)
 # --------------------------
 def run_job(args):
     set_job(running=True, progress="Starting…", current=0, total=0, rows=[], csv_bytes=b"", error="")
+    try:
+        # 1) API key (env only; field hidden)
+        api_key = (os.getenv("GOOGLE_API_KEY") or os.getenv("GMAPS_KEY") or "").strip()
+        if not api_key:
+            set_job(running=False, error="No API key provided in env (set GOOGLE_API_KEY or GMAPS_KEY).")
+            return
+        gmaps_client = googlemaps.Client(key=api_key)
 
-    api_key = (os.getenv("GOOGLE_API_KEY") or os.getenv("GMAPS_KEY") or "").strip()
-    if not api_key:
-        set_job(running=False, error="No API key provided (set GOOGLE_API_KEY or GMAPS_KEY)."); return
+        # 2) Discovery bounds
+        place_text = args["place_text"]
+        vp = geocode_viewport(gmaps_client, place_text)
+        if not vp:
+            set_job(running=False, error="Could not geocode that place.")
+            return
+        north, south, east, west = vp
 
-    gmaps_client = googlemaps.Client(key=api_key)
+        radius_km, step_factor = args["radius_km"], args["step_factor"]
+        max_tiles, max_total_places = args["max_tiles"], args["max_total_places"]
 
-    vp = geocode_viewport(gmaps_client, args["place_text"])
-    if not vp:
-        set_job(running=False, error="Could not geocode that place."); return
-    north, south, east, west = vp
+        centers_all = list(make_grid(north, south, east, west, radius_km, step_factor))
+        center_lat = (north + south)/2.0; center_lon = (east + west)/2.0
+        centers_sorted = sort_center_out(centers_all, center_lat, center_lon)
+        centers = centers_sorted[:max_tiles] if len(centers_sorted) > max_tiles else centers_sorted
 
-    radius_km, step_factor = args["radius_km"], args["step_factor"]
-    max_total_places = args["max_total_places"]
+        # 3) Names for persistence
+        slug = slugify(place_text or "region")
+        out_csv = f"{slug}_dental_clinics_with_emails.csv"
+        ckpt = f"ckpt_{slug}.json"
 
-    # Build full grid that fits the region
-    centers_all = list(make_grid(north, south, east, west, radius_km, step_factor))
-    center_lat = (north + south)/2.0; center_lon = (east + west)/2.0
-    centers = sort_center_out(centers_all, center_lat, center_lon)
+        # Load checkpoint (done_ids) and already-saved CSV
+        ck = load_checkpoint(ckpt)
+        done_ids = set(ck.get("done_ids", []))
+        existing_df = load_csv_if_any(out_csv)
+        if not existing_df.empty and "Place ID" in existing_df.columns:
+            done_ids |= set(existing_df["Place ID"].astype(str).tolist())
 
-    # Show discovery progress over the *full* region
-    set_job(progress=f"Discovery 0/{len(centers)} tiles…", current=0, total=len(centers))
+        # 4) Collect places
+        place_ids = {}
+        for i, (lat, lon) in enumerate(centers, start=1):
+            set_job(progress=f"Discovery {i}/{len(centers)} tiles…")
+            nearby = fetch_nearby_all_pages(gmaps_client, (lat, lon), int(radius_km*1000), type_="dentist")
+            for pl in nearby:
+                pid = str(pl.get("place_id"))
+                if pid and pid not in place_ids:
+                    place_ids[pid] = pl
+                    if len(place_ids) >= max_total_places:
+                        break
+            if len(place_ids) >= max_total_places:
+                break
 
-    place_ids = {}
-    for i, (lat, lon) in enumerate(centers, start=1):
-        nearby = fetch_nearby_all_pages(gmaps_client, (lat, lon), int(radius_km*1000), type_="dentist")
-        for pl in nearby:
-            pid = pl.get("place_id")
-            if pid and pid not in place_ids:
-                place_ids[pid] = pl
-                if len(place_ids) >= max_total_places:
-                    break
-        set_job(progress=f"Discovery {i}/{len(centers)} tiles…", current=i, total=len(centers))
-        if len(place_ids) >= max_total_places:
-            break
+        if not place_ids:
+            set_job(running=False, error="No clinics found.")
+            return
 
-    if not place_ids:
-        set_job(running=False, error="No clinics found in region."); return
+        ids = list(place_ids.keys())
+        # Skip ones already done (from ckpt or CSV)
+        ids = [pid for pid in ids if pid not in done_ids]
 
-    ids = list(place_ids.keys())
+        total = len(ids)
+        set_job(progress="Scraping details…", current=0, total=total)
 
-    # Switch progress to scraping phase
-    set_job(progress="Scraping details…", current=0, total=len(ids))
+        rows_buffer = []
 
-    rows_buffer = []
+        def worker(pid):
+            det = gmaps_place_details(gmaps_client, pid)
+            r = det.get("result", {})
+            practice = r.get("name"); addr = r.get("formatted_address")
+            site = (r.get("website") or "").strip()
 
-    def worker(pid):
-        det = gmaps_place_details(gmaps_client, pid)
-        r = det.get("result", {})
-        practice = r.get("name"); addr = r.get("formatted_address")
-        site = (r.get("website") or "").strip()
+            principal, emails, email_src, principal_src = ("", set(), "", "")
+            if site:
+                principal, emails, email_src, principal_src = crawl_site(
+                    site, max_pages=args["max_pages_per_site"], max_seconds=args["max_seconds_per_site"], progress_cb=None
+                )
 
-        principal, emails, email_src, principal_src = ("", set(), "", "")
-        if site:
-            principal, emails, email_src, principal_src = crawl_site(
-                site, max_pages=args["max_pages_per_site"], max_seconds=args["max_seconds_per_site"], progress_cb=None
-            )
+            row = {
+                "Practice": practice or "", "Address": addr or "", "Website": site,
+                "Principal / Owner (guess)": principal,
+                "Emails found": ", ".join(sorted(emails)) if emails else "",
+                "First email source": email_src, "Principal source": principal_src or site,
+                "Place ID": pid
+            }
+            # if literally nothing, return minimal (we'll still mark done to avoid rework)
+            return row
 
-        return {
-            "Practice": practice or "", "Address": addr or "", "Website": site,
-            "Principal / Owner (guess)": principal,
-            "Emails found": ", ".join(sorted(emails)) if emails else "",
-            "First email source": email_src, "Principal source": principal_src or site,
-            "Place ID": pid
-        }
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            idx = 0
+            while idx < len(ids):
+                batch = ids[idx: min(idx + MAX_WORKERS, len(ids))]
+                fut_map = {pool.submit(worker, pid): pid for pid in batch}
+                for fut in list(fut_map.keys()):
+                    pid = fut_map[fut]
+                    try:
+                        row = fut.result(timeout=PLACE_TIMEOUT)
+                    except FuturesTimeout:
+                        row = {"Practice":"","Address":"","Website":"","Principal / Owner (guess)":"",
+                               "Emails found":"","First email source":"","Principal source":"",
+                               "Place ID": pid, "Error": f"Timeout after {PLACE_TIMEOUT}s"}
+                    except Exception as e:
+                        row = {"Practice":"","Address":"","Website":"","Principal / Owner (guess)":"",
+                               "Emails found":"","First email source":"","Principal source":"",
+                               "Place ID": pid, "Error": str(e)}
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        idx = 0
-        while idx < len(ids):
-            batch = ids[idx: min(idx + MAX_WORKERS, len(ids))]
-            futures = {pool.submit(worker, pid): pid for pid in batch}
-            for fut in futures:
-                try:
-                    row = fut.result(timeout=PLACE_TIMEOUT)
-                except FuturesTimeout:
-                    row = {"Practice":"","Address":"","Website":"","Principal / Owner (guess)":"",
-                           "Emails found":"","First email source":"","Principal source":"",
-                           "Place ID": futures[fut], "Error": f"Timeout after {PLACE_TIMEOUT}s"}
-                except Exception as e:
-                    row = {"Practice":"","Address":"","Website":"","Principal / Owner (guess)":"",
-                           "Emails found":"","First email source":"","Principal source":"",
-                           "Place ID": futures[fut], "Error": str(e)}
+                    rows_buffer.append(row)
+                    done_ids.add(pid)
 
-                # keep row even if sparse; duplicates removed later by Place ID
-                rows_buffer.append(row)
+                    with job_lock:
+                        job["current"] += 1
 
-                with job_lock:
-                    job["current"] += 1
-                    cur = job["current"]
-            idx += len(batch)
-            set_job(progress=f"Scraping {job['current']}/{len(ids)}…", total=len(ids))
+                    # Periodic flush to disk & checkpoint
+                    if (job["current"] % FLUSH_EVERY) == 0:
+                        try:
+                            append_rows_csv(out_csv, rows_buffer)
+                            rows_buffer = []
+                            save_checkpoint(ckpt, done_ids)
+                        except Exception as e:
+                            log("Flush error:", e)
 
-    df = pd.DataFrame(rows_buffer)
-    if "Place ID" in df.columns:
-        df = df.drop_duplicates(subset=["Place ID"]).reset_index(drop=True)
+                idx += len(batch)
+                set_job(progress=f"Scraping {job['current']}/{total}…")
 
-    buf = io.BytesIO()
-    df.to_csv(buf, index=False); buf.seek(0)
+        # Final flush
+        append_rows_csv(out_csv, rows_buffer)
+        save_checkpoint(ckpt, done_ids)
 
-    set_job(running=False, progress=f"Done. {len(df)} clinics.", rows=df.to_dict("records"),
-            csv_bytes=buf.read(), error="", total=len(ids))
+        # Load final CSV for UI
+        df = load_csv_if_any(out_csv)
+        if "Place ID" in df.columns:
+            df = df.drop_duplicates(subset=["Place ID"]).reset_index(drop=True)
+
+        buf = io.BytesIO()
+        df.to_csv(buf, index=False); buf.seek(0)
+
+        set_job(running=False, progress=f"Done. {len(df)} clinics.",
+                rows=df.to_dict("records"), csv_bytes=buf.read(), error="", total=total)
+
+    except Exception as e:
+        log("RUN_JOB CRASH:\n", traceback.format_exc())
+        set_job(running=False, error=f"Crash: {e}", progress="Crashed")
 
 # --------------------------
 # Poll UI for progress
@@ -538,7 +627,7 @@ def poll_status(_):
     return status, bar, info, rows
 
 # --------------------------
-# Start job (no API field; uses env var)
+# Start job
 # --------------------------
 @app.callback(
     Output("kick","data"),
@@ -546,12 +635,13 @@ def poll_status(_):
     State("place_text","value"),
     State("radius_km","value"),
     State("step_factor","value"),
+    State("max_tiles","value"),
     State("max_total_places","value"),
     State("max_pages_per_site","value"),
     State("max_seconds_per_site","value"),
     prevent_initial_call=True
 )
-def start(n, place_text, radius_km, step_factor, max_total_places,
+def start(n, place_text, radius_km, step_factor, max_tiles, max_total_places,
           max_pages_per_site, max_seconds_per_site):
     if not n:
         return no_update
@@ -562,6 +652,7 @@ def start(n, place_text, radius_km, step_factor, max_total_places,
         "place_text": place_text or "Brisbane QLD",
         "radius_km": float(radius_km) if radius_km is not None else 2.5,
         "step_factor": float(step_factor) if step_factor is not None else 1.5,
+        "max_tiles": int(max_tiles) if max_tiles is not None else 200,
         "max_total_places": int(max_total_places) if max_total_places is not None else 3000,
         "max_pages_per_site": int(max_pages_per_site) if max_pages_per_site is not None else 80,
         "max_seconds_per_site": int(max_seconds_per_site) if max_seconds_per_site is not None else 90,
@@ -588,4 +679,5 @@ def do_download(n):
 # Entry
 # --------------------------
 if __name__ == "__main__":
+    # For local runs; Render will use gunicorn
     app.run(host="0.0.0.0", port=int(os.getenv("PORT","8050")), debug=False)
