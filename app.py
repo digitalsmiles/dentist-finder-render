@@ -31,8 +31,7 @@ BINARY_EXTS = (".pdf",".doc",".docx",".xls",".xlsx",".ppt",".pptx",".zip",".rar"
                ".png",".jpg",".jpeg",".gif",".svg",".webp",".mp4",".avi",".mov",".wmv")
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 }
 
 DEFAULT_LIKELY = ["contact","contact-us","book","appointments",
@@ -226,27 +225,6 @@ def fetch_nearby_all_pages(gmaps_client, center, radius_m, type_="dentist"):
             time.sleep(0.6 * (2 ** attempt) + random.random() * JITTER)
     return out
 
-def gmaps_text_search_all(gmaps_client, query):
-    results = []
-    p = None
-    for attempt in range(RETRIES + 1):
-        try:
-            p = gmaps_client.places(query=query); break
-        except Exception:
-            time.sleep(0.6 * (2 ** attempt) + random.random() * JITTER)
-    if not p: return results
-    results += p.get("results", [])
-    while "next_page_token" in p:
-        time.sleep(NEARBY_SLEEP + random.random() * JITTER)
-        for attempt in range(RETRIES + 1):
-            try:
-                p = gmaps_client.places(query=query, page_token=p["next_page_token"]); break
-            except Exception:
-                time.sleep(0.6 * (2 ** attempt) + random.random() * JITTER)
-        if not p: break
-        results += p.get("results", [])
-    return results
-
 def gmaps_place_details(gmaps_client, place_id):
     for attempt in range(RETRIES + 1):
         try:
@@ -309,15 +287,8 @@ def geocode_viewport(gmaps_client, place_text: str):
 # ==========================
 # Background job state
 # ==========================
-job = {
-    "running": False,
-    "progress": "Idle",
-    "current": 0,
-    "total": 0,
-    "rows": [],
-    "csv_bytes": b"",
-    "error": "",
-}
+job = {"running": False, "progress": "Idle", "current": 0, "total": 0,
+       "rows": [], "csv_bytes": b"", "error": ""}
 job_lock = threading.Lock()
 
 def set_job(**updates):
@@ -327,30 +298,33 @@ def set_job(**updates):
 # ==========================
 # Dash app & layout
 # ==========================
-app = Dash(
-    __name__,
-    title="Dental Finder (Dash)",
-    suppress_callback_exceptions=True,   # allow components that appear later
-)
+app = Dash(__name__, title="Dental Finder (Dash)", suppress_callback_exceptions=True)
 server = app.server
 
 app.layout = html.Div(
     style={"fontFamily":"system-ui,-apple-system,Segoe UI,Arial","maxWidth":"1100px","margin":"0 auto","padding":"18px"},
     children=[
-        html.H2("Dental Finder 🦷 — Dash"),
+        html.H2("Dental Finder 🦷 — Dash (Region Sweep only)"),
         dcc.Input(id="api_key", placeholder="Google API key (optional if set as env var)", type="password", style={"width":"420px"}),
         html.Br(), html.Br(),
-        dcc.Dropdown(
-            id="mode",
-            options=[
-                {"label":"Text Search (max 60)","value":"text"},
-                {"label":"Citywide Sweep (manual bounds)","value":"bounds"},
-                {"label":"Region Sweep by place name","value":"region"},
-            ],
-            value="text",
-            style={"width":"360px"}
-        ),
-        html.Div(id="mode-controls", style={"marginTop":"10px"}),
+
+        html.Label("Place (AU city/suburb/state/postcode)"),
+        dcc.Input(id="place_text", value="Brisbane QLD", style={"width":"60%"}),
+
+        html.Div([
+            dcc.Input(id="radius_km", type="number", value=2.5, step=0.5, placeholder="Radius km"),
+            dcc.Input(id="step_factor", type="number", value=1.5, step=0.1, placeholder="Step factor", style={"marginLeft":"8px"}),
+            dcc.Input(id="max_tiles", type="number", value=200, step=10, placeholder="Max tiles", style={"marginLeft":"8px"}),
+            dcc.Input(id="max_total_places", type="number", value=3000, step=100, placeholder="Max clinics", style={"marginLeft":"8px"}),
+        ], style={"marginTop":"8px"}),
+
+        html.Div([
+            dcc.Input(id="max_pages_per_site", type="number", value=20, step=1, placeholder="Max pages/site"),
+            dcc.Input(id="max_seconds_per_site", type="number", value=30, step=5, placeholder="Max seconds/site", style={"marginLeft":"8px"}),
+            dcc.Checklist(id="fast_mode", options=[{"label":" Fast mode","value":"on"}], value=["on"], style={"display":"inline-block","marginLeft":"12px"}),
+            dcc.Checklist(id="only_paths", options=[{"label":" Only likely paths","value":"on"}], value=[], style={"display":"inline-block","marginLeft":"12px"}),
+            dcc.Input(id="paths_txt", value="contact,about,team,staff", style={"width":"320px","marginLeft":"8px"}),
+        ], style={"marginTop":"8px"}),
 
         html.Br(),
         html.Button("Start sweep", id="start", n_clicks=0, style={"padding":"8px 14px"}),
@@ -369,50 +343,14 @@ app.layout = html.Div(
         html.Button("Download CSV", id="download-btn"),
         dcc.Download(id="download"),
 
-        # Hidden store to avoid duplicate-output issues
         dcc.Store(id="kick"),
-        # Polling timer
         dcc.Interval(id="poll", interval=1500, n_intervals=0),
     ]
 )
 
-# Dynamic controls per mode
-@app.callback(Output("mode-controls","children"), Input("mode","value"))
-def render_mode_controls(mode):
-    if mode == "text":
-        return html.Div([
-            html.Label("Query"),
-            dcc.Input(id="q", value="dentist Brisbane", style={"width":"60%"}),
-        ])
-    elif mode == "bounds":
-        return html.Div([
-            html.Div("Manual bounds (N/S/E/W)"),
-            html.Div([
-                dcc.Input(id="north", type="number", value=-27.00, step=0.00001, placeholder="North"),
-                dcc.Input(id="south", type="number", value=-27.75, step=0.00001, placeholder="South", style={"marginLeft":"8px"}),
-                dcc.Input(id="east",  type="number", value=153.30, step=0.00001, placeholder="East",  style={"marginLeft":"8px"}),
-                dcc.Input(id="west",  type="number", value=152.60, step=0.00001, placeholder="West",  style={"marginLeft":"8px"}),
-            ], style={"marginTop":"6px"}),
-            html.Div([
-                dcc.Input(id="radius_km", type="number", value=2.5, step=0.5, placeholder="Radius km"),
-                dcc.Input(id="step_factor", type="number", value=1.5, step=0.1, placeholder="Step factor", style={"marginLeft":"8px"}),
-                dcc.Input(id="max_tiles", type="number", value=200, step=10, placeholder="Max tiles", style={"marginLeft":"8px"}),
-                dcc.Input(id="max_total_places", type="number", value=3000, step=100, placeholder="Max clinics", style={"marginLeft":"8px"}),
-            ], style={"marginTop":"8px"}),
-        ])
-    else:  # region
-        return html.Div([
-            html.Label("Place (AU city/suburb/state/postcode)"),
-            dcc.Input(id="place_text", value="Brisbane QLD", style={"width":"60%"}),
-            html.Div([
-                dcc.Input(id="radius_km", type="number", value=2.5, step=0.5, placeholder="Radius km"),
-                dcc.Input(id="step_factor", type="number", value=1.5, step=0.1, placeholder="Step factor", style={"marginLeft":"8px"}),
-                dcc.Input(id="max_tiles", type="number", value=200, step=10, placeholder="Max tiles", style={"marginLeft":"8px"}),
-                dcc.Input(id="max_total_places", type="number", value=3000, step=100, placeholder="Max clinics", style={"marginLeft":"8px"}),
-            ], style={"marginTop":"8px"}),
-        ])
-
-# Background job runner
+# --------------------------
+# Job runner (region only)
+# --------------------------
 def run_job(args):
     set_job(running=True, progress="Starting…", current=0, total=0, rows=[], csv_bytes=b"", error="")
 
@@ -421,44 +359,31 @@ def run_job(args):
         set_job(running=False, error="No API key provided."); return
 
     gmaps_client = googlemaps.Client(key=api_key)
-    mode = args["mode"]
+
+    vp = geocode_viewport(gmaps_client, args["place_text"])
+    if not vp:
+        set_job(running=False, error="Could not geocode that place."); return
+    north, south, east, west = vp
+    name_hint = slugify(args["place_text"] or "region")
+
+    radius_km, step_factor = args["radius_km"], args["step_factor"]
+    max_tiles, max_total_places = args["max_tiles"], args["max_total_places"]
+
+    centers_all = list(make_grid(north, south, east, west, radius_km, step_factor))
+    center_lat = (north + south)/2.0; center_lon = (east + west)/2.0
+    centers_sorted = sort_center_out(centers_all, center_lat, center_lon)
+    centers = centers_sorted[:max_tiles] if len(centers_sorted) > max_tiles else centers_sorted
 
     place_ids = {}
-    if mode == "text":
-        query = args["query"]
-        all_places = gmaps_text_search_all(gmaps_client, query)
-        for pl in all_places:
+    for i, (lat, lon) in enumerate(centers, start=1):
+        set_job(progress=f"Discovery {i}/{len(centers)} tiles…")
+        nearby = fetch_nearby_all_pages(gmaps_client, (lat, lon), int(radius_km*1000), type_="dentist")
+        for pl in nearby:
             pid = pl.get("place_id")
-            if pid: place_ids[pid] = pl
-        name_hint = slugify(query or "text_search")
-    else:
-        if mode == "bounds":
-            north, south, east, west = args["north"], args["south"], args["east"], args["west"]
-            name_hint = "manual_bounds"
-        else:
-            vp = geocode_viewport(gmaps_client, args["place_text"])
-            if not vp:
-                set_job(running=False, error="Could not geocode that place."); return
-            north, south, east, west = vp
-            name_hint = slugify(args["place_text"] or "region")
-
-        radius_km, step_factor = args["radius_km"], args["step_factor"]
-        max_tiles, max_total_places = args["max_tiles"], args["max_total_places"]
-
-        centers_all = list(make_grid(north, south, east, west, radius_km, step_factor))
-        center_lat = (north + south)/2.0; center_lon = (east + west)/2.0
-        centers_sorted = sort_center_out(centers_all, center_lat, center_lon)
-        centers = centers_sorted[:max_tiles] if len(centers_sorted) > max_tiles else centers_sorted
-
-        for i, (lat, lon) in enumerate(centers, start=1):
-            set_job(progress=f"Discovery {i}/{len(centers)} tiles…")
-            nearby = fetch_nearby_all_pages(gmaps_client, (lat, lon), int(radius_km*1000), type_="dentist")
-            for pl in nearby:
-                pid = pl.get("place_id")
-                if pid and pid not in place_ids:
-                    place_ids[pid] = pl
-                    if len(place_ids) >= max_total_places: break
-            if len(place_ids) >= max_total_places: break
+            if pid and pid not in place_ids:
+                place_ids[pid] = pl
+                if len(place_ids) >= max_total_places: break
+        if len(place_ids) >= max_total_places: break
 
     if not place_ids:
         set_job(running=False, error="No clinics found."); return
@@ -473,20 +398,17 @@ def run_job(args):
     rows_buffer = []
     set_job(progress="Scraping details…", current=0, total=len(ids))
 
-    def process_place(pid):
+    def worker(pid):
         det = gmaps_place_details(gmaps_client, pid)
         r = det.get("result", {})
         practice = r.get("name"); addr = r.get("formatted_address")
         site = (r.get("website") or "").strip()
 
-        def _site_cb(done, cap):
-            pass  # per-site progress (not shown globally)
-
         principal, emails, email_src, principal_src = ("", set(), "", "")
         if site:
             principal, emails, email_src, principal_src = crawl_site(
                 site, max_pages=max_pages_per_site, max_seconds=max_seconds_per_site,
-                progress_cb=_site_cb, fast_mode=fast_mode, only_paths=only_paths, tokens=tokens
+                progress_cb=None, fast_mode=fast_mode, only_paths=only_paths, tokens=tokens
             )
         return {
             "Practice": practice or "", "Address": addr or "", "Website": site,
@@ -500,7 +422,7 @@ def run_job(args):
         idx = 0
         while idx < len(ids):
             batch = ids[idx: min(idx + MAX_WORKERS, len(ids))]
-            futures = {pool.submit(process_place, pid): pid for pid in batch}
+            futures = {pool.submit(worker, pid): pid for pid in batch}
             for fut in futures:
                 try:
                     row = fut.result(timeout=PLACE_TIMEOUT)
@@ -525,10 +447,12 @@ def run_job(args):
     buf = io.BytesIO()
     df.to_csv(buf, index=False); buf.seek(0)
 
-    set_job(running=False, progress="Done.", rows=df.to_dict("records"),
+    set_job(running=False, progress=f"Done. {len(df)} clinics.", rows=df.to_dict("records"),
             csv_bytes=buf.read(), error="", total=len(ids))
 
+# --------------------------
 # Poll UI for progress
+# --------------------------
 @app.callback(
     Output("status","children"),
     Output("progress-bar","children"),
@@ -553,54 +477,51 @@ def poll_status(_):
     status = ("⏳ " if running else "✅ ") + prog
     return status, bar, info, rows
 
-# Start job (writes to hidden store to avoid duplicate-output conflicts)
+# --------------------------
+# Start job
+# --------------------------
 @app.callback(
     Output("kick","data"),
     Input("start","n_clicks"),
     State("api_key","value"),
-    State("mode","value"),
-    State("q","value"),
-    State("north","value"),
-    State("south","value"),
-    State("east","value"),
-    State("west","value"),
     State("place_text","value"),
     State("radius_km","value"),
     State("step_factor","value"),
     State("max_tiles","value"),
     State("max_total_places","value"),
+    State("max_pages_per_site","value"),
+    State("max_seconds_per_site","value"),
+    State("fast_mode","value"),
+    State("only_paths","value"),
+    State("paths_txt","value"),
     prevent_initial_call=True
 )
-def start(n, api_key, mode, q, north, south, east, west, place_text,
-          radius_km, step_factor, max_tiles, max_total_places):
+def start(n, api_key, place_text, radius_km, step_factor, max_tiles, max_total_places,
+          max_pages_per_site, max_seconds_per_site, fast_mode, only_paths, paths_txt):
     if not n:
         return no_update
     if job["running"]:
         return {"msg":"already running"}
 
     args = {
-        "mode": mode,
         "api_key": (api_key or "").strip(),
-        "query": q or "dentist Brisbane",
-        "north": float(north) if north is not None else -27.00,
-        "south": float(south) if south is not None else -27.75,
-        "east":  float(east)  if east  is not None else 153.30,
-        "west":  float(west)  if west  is not None else 152.60,
         "place_text": place_text or "Brisbane QLD",
         "radius_km": float(radius_km) if radius_km is not None else 2.5,
         "step_factor": float(step_factor) if step_factor is not None else 1.5,
         "max_tiles": int(max_tiles) if max_tiles is not None else 200,
         "max_total_places": int(max_total_places) if max_total_places is not None else 3000,
-        "max_pages_per_site": 20,
-        "max_seconds_per_site": 30,
-        "fast_mode": FAST_MODE_DEFAULT,
-        "only_paths": False,
-        "paths_txt": "contact,about,team,staff",
+        "max_pages_per_site": int(max_pages_per_site) if max_pages_per_site is not None else 20,
+        "max_seconds_per_site": int(max_seconds_per_site) if max_seconds_per_site is not None else 30,
+        "fast_mode": ("on" in (fast_mode or [])),
+        "only_paths": ("on" in (only_paths or [])),
+        "paths_txt": paths_txt or "contact,about,team,staff",
     }
     threading.Thread(target=run_job, args=(args,), daemon=True).start()
     return {"msg":"started", "ts": time.time()}
 
+# --------------------------
 # Download CSV
+# --------------------------
 @app.callback(
     Output("download","data"),
     Input("download-btn","n_clicks"),
@@ -613,6 +534,8 @@ def do_download(n):
         return no_update
     return dcc.send_bytes(lambda b: b.write(data), "dental_clinics_with_emails.csv")
 
+# --------------------------
 # Entry
+# --------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT","8050")), debug=False)
