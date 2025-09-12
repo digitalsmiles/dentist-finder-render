@@ -381,7 +381,7 @@ app.layout = html.Div(
     id="app-root",
     style={"fontFamily":"system-ui,-apple-system,Segoe UI,Arial","maxWidth":"1100px","margin":"0 auto","padding":"18px"},
     children=[
-        html.H2("Dental Finder 🦷"),
+        html.H2("Dental Finder"),
 
         api_key_block,
 
