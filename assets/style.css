@@ -156,6 +156,16 @@ button:hover {
 button:active { transform: translateY(1px); }
 #start { margin-right: 10px; } /* a bit of spacing before status text */
 
+/* Stop button - red theme */
+#stop {
+  background: linear-gradient(180deg, #ff6a6a, #f03a3a);
+  box-shadow: 0 8px 20px rgba(239, 68, 68, .25);
+}
+#stop:hover {
+  filter: brightness(1.05);
+  box-shadow: 0 10px 22px rgba(239, 68, 68, .35);
+}
+
 /* ---------- Status & progress bar ---------- */
 #status {
   font-weight: 600;

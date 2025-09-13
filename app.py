@@ -360,6 +360,10 @@ def crawl_site(site_url: str, max_pages: int, max_seconds: int, progress_cb=None
     pages_scanned = 0
 
     while queue and pages_scanned < max_pages and (time.time() - t0) < max_seconds:
+        # Check for cancellation
+        if is_cancel_requested():
+            break
+            
         url = queue.popleft()
         pages_scanned += 1
 
@@ -479,7 +483,7 @@ def geocode_viewport(gmaps_client, place_text: str):
 # ==========================
 job = {
     "running": False, "progress": "Ready", "current": 0, "total": 0,
-    "rows": [], "csv_bytes": b"", "error": "", "diag": ""
+    "rows": [], "csv_bytes": b"", "error": "", "diag": "", "cancel_requested": False
 }
 job_lock = threading.Lock()
 
@@ -491,11 +495,19 @@ def is_job_running():
     with job_lock:
         return job.get("running", False)
 
+def is_cancel_requested():
+    with job_lock:
+        return job.get("cancel_requested", False)
+
+def request_cancel():
+    with job_lock:
+        job["cancel_requested"] = True
+
 def reset_job():
     with job_lock:
         job.update({
             "running": False, "progress": "Ready", "current": 0, "total": 0,
-            "rows": [], "csv_bytes": b"", "error": "", "diag": ""
+            "rows": [], "csv_bytes": b"", "error": "", "diag": "", "cancel_requested": False
         })
 
 # ==========================
@@ -533,6 +545,7 @@ app.layout = html.Div(
 
         html.Br(),
         html.Button("Start sweep", id="start", n_clicks=0, style={"padding":"8px 14px"}),
+        html.Button("Stop", id="stop", n_clicks=0, style={"padding":"8px 14px", "marginLeft":"10px", "display":"none"}),
         html.Span(id="status", style={"marginLeft":"12px"}),
 
         html.Div(id="diag", style={"marginTop":"6px", "fontSize":"12px", "opacity":0.8}),
@@ -594,6 +607,11 @@ def run_job(args):
 
         place_ids = {}
         for i, (lat, lon) in enumerate(centers, start=1):
+            # Check for cancellation
+            if is_cancel_requested():
+                set_job(running=False, progress="Stopped", error="", diag="Job cancelled by user")
+                return
+                
             set_job(progress=f"Discovery {i}/{len(centers)} tiles…")
             nearby = fetch_nearby_all_pages(gmaps_client, (lat, lon), int(radius_km*1000), type_="dentist")
             for pl in nearby:
@@ -638,6 +656,11 @@ def run_job(args):
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
             idx = 0
             while idx < len(ids):
+                # Check for cancellation before each batch
+                if is_cancel_requested():
+                    set_job(running=False, progress="Stopped", error="", diag="Job cancelled by user")
+                    return
+                    
                 batch = ids[idx: min(idx + MAX_WORKERS, len(ids))]
                 futures = {pool.submit(worker, pid): pid for pid in batch}
                 for fut in futures:
@@ -659,6 +682,23 @@ def run_job(args):
                         job["current"] += 1
                 idx += len(batch)
                 set_job(progress=f"Scraping {job['current']}/{len(ids)}…")
+
+        # Check if cancelled one more time before saving results
+        if is_cancel_requested():
+            # Save partial results if any were collected
+            if rows_buffer:
+                df = pd.DataFrame(rows_buffer)
+                if "Place ID" in df.columns:
+                    df = df.drop_duplicates(subset=["Place ID"]).reset_index(drop=True)
+                buf = io.BytesIO()
+                df.to_csv(buf, index=False)
+                buf.seek(0)
+                set_job(running=False, progress=f"Stopped. {len(df)} clinics collected.",
+                        rows=df.to_dict("records"), csv_bytes=buf.read(), error="", 
+                        diag="Job cancelled by user")
+            else:
+                set_job(running=False, progress="Stopped", error="", diag="Job cancelled by user")
+            return
 
         df = pd.DataFrame(rows_buffer)
         if "Place ID" in df.columns:
@@ -682,6 +722,7 @@ def run_job(args):
     Output("progress-bar","children"),
     Output("progress-info","children"),
     Output("table","data"),
+    Output("stop","style"),
     Input("poll","n_intervals"),
 )
 def poll_status(_):
@@ -689,7 +730,8 @@ def poll_status(_):
         running = job["running"]; prog = job["progress"]; cur = job["current"]
         tot = job["total"]; rows = job["rows"]; err = job["error"]; diag = job["diag"]
     if err:
-        return f"❌ {err}", diag, None, "", []
+        stop_style = {"padding":"8px 14px", "marginLeft":"10px", "display":"none"}
+        return f"❌ {err}", diag, None, "", [], stop_style
     bar = None
     if tot:
         pct = int(100 * (cur / max(1, tot)))
@@ -698,7 +740,31 @@ def poll_status(_):
     else:
         info = prog
     status = ("⏳ " if running else "✅ ") + prog
-    return status, diag, bar, info, rows
+    
+    # Show stop button only when job is running
+    stop_style = {
+        "padding":"8px 14px", "marginLeft":"10px", 
+        "display":"inline-block" if running else "none"
+    }
+    
+    return status, diag, bar, info, rows, stop_style
+
+# --------------------------
+# Stop job
+# --------------------------
+@app.callback(
+    Output("kick","data", allow_duplicate=True),
+    Input("stop","n_clicks"),
+    prevent_initial_call=True
+)
+def stop_job(n):
+    if not n:
+        return no_update
+    if is_job_running():
+        request_cancel()
+        set_job(progress="Stopping...", diag="Cancellation requested")
+        return {"msg":"stop_requested", "ts": time.time()}
+    return no_update
 
 # --------------------------
 # Start job (only one at a time)
