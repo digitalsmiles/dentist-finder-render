@@ -481,6 +481,9 @@ def geocode_viewport(gmaps_client, place_text: str):
 # ==========================
 # Background job state
 # ==========================
+# The job state includes a cancellation mechanism that allows users to stop
+# running sweep jobs immediately from the UI. The cancel_requested flag is 
+# checked at key points during job execution to enable clean termination.
 job = {
     "running": False, "progress": "Ready", "current": 0, "total": 0,
     "rows": [], "csv_bytes": b"", "error": "", "diag": "", "cancel_requested": False
@@ -751,6 +754,8 @@ def poll_status(_):
 
 # --------------------------
 # Stop job
+# Allows users to cancel running sweep jobs immediately.
+# Sets a cancellation flag that is checked during job execution.
 # --------------------------
 @app.callback(
     Output("kick","data", allow_duplicate=True),
