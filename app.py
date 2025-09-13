@@ -12,6 +12,9 @@ from urllib3.util.retry import Retry
 
 from dash import Dash, html, dcc, Input, Output, State, dash_table, no_update
 
+# ==========================
+# Tunables (stable & safe)
+# ==========================
 CONNECT_TIMEOUT = 5
 READ_TIMEOUT = 25
 TIMEOUT = (CONNECT_TIMEOUT, READ_TIMEOUT)
@@ -220,11 +223,9 @@ def extract_mobiles_and_owners(soup, page_url):
         mobile = re.sub(r"\D", "", m.group(0))
         owner = ""
         before = text[:m.start()]
-        # Try to find the nearest "Dr ..." or name within 120 chars before the mobile
         dr_match = re.findall(r"(Dr\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})", before[-120:])
         if dr_match:
             owner = normalize_name(dr_match[-1])
-        # If no "Dr", try to find named staff or principal
         results.append({
             "mobile": mobile,
             "owner": owner,
@@ -235,7 +236,9 @@ def extract_mobiles_and_owners(soup, page_url):
 def crawl_site(site_url: str, max_pages: int, max_seconds: int, progress_cb=None, practice_name=None):
     t0 = time.time()
     html, canon = http_get(site_url)
-    if not html: return "", set(), "", site_url, "", "", "", "", ""
+    if not html:
+        print(f"Could not fetch homepage: {site_url}")
+        return "", set(), "", site_url, "", "", "", "", ""
     queue, seen = deque(), set()
     queue.append(canon); seen.add(canon)
     principal_candidates, owners, founders = [], [], []
@@ -247,7 +250,6 @@ def crawl_site(site_url: str, max_pages: int, max_seconds: int, progress_cb=None
         pages_scanned += 1
         html, final_url = http_get(url)
         if not html:
-            if progress_cb: progress_cb(pages_scanned, max_pages)
             continue
         soup = BeautifulSoup(html, "lxml")
         found = extract_emails(soup)
@@ -265,7 +267,6 @@ def crawl_site(site_url: str, max_pages: int, max_seconds: int, progress_cb=None
                 internal.append(u)
         for u in internal:
             seen.add(u); queue.append(u)
-        if progress_cb: progress_cb(pages_scanned, max_pages)
         time.sleep(CRAWL_SLEEP + random.random() * JITTER)
     principal_candidates = dedupe(principal_candidates)
     owners = dedupe(owners)
@@ -277,6 +278,7 @@ def crawl_site(site_url: str, max_pages: int, max_seconds: int, progress_cb=None
     mobiles = [rec["mobile"] for rec in mobile_records]
     mobile_owners = [rec["owner"] for rec in mobile_records]
     mobile_sources = [rec["source"] for rec in mobile_records]
+    print(f"Scraped site {site_url}: principal={principal_candidates} owners={owners} founders={founders} emails={emails} mobiles={mobiles}")
     return (
         ", ".join(principal_candidates) if principal_candidates else "",
         emails,
@@ -359,6 +361,7 @@ def run_job(args):
     try:
         set_job(progress="Starting worker…", running=True, error="", diag="")
         api_key = (os.getenv("GOOGLE_API_KEY") or os.getenv("GMAPS_KEY") or "").strip()
+        print("GOOGLE_API_KEY set?", bool(api_key))
         if not api_key:
             set_job(running=False, error="No Google API key found in env (GOOGLE_API_KEY or GMAPS_KEY).",
                     progress="Stopped")
@@ -372,6 +375,7 @@ def run_job(args):
         max_pages_per_site = int(args.get("max_pages_per_site", 80))
         max_seconds_per_site = int(args.get("max_seconds_per_site", 90))
         vp = geocode_viewport(gmaps_client, place_text)
+        print("Geocode viewport:", vp)
         if not vp:
             set_job(running=False, error=f"Could not geocode: {place_text}", progress="Stopped")
             return
@@ -381,17 +385,21 @@ def run_job(args):
         center_lon = (east + west)/2.0
         centers_sorted = sort_center_out(centers_all, center_lat, center_lon)
         centers = centers_sorted[:max_tiles] if len(centers_sorted) > max_tiles else centers_sorted
+        print(f"Tiles planned: {len(centers)}")
         set_job(diag=f"Key: OK • Tiles planned: {len(centers)} • Max clinics: {max_total_places}")
         place_ids = {}
         for i, (lat, lon) in enumerate(centers, start=1):
+            print(f"Tile {i}/{len(centers)}: ({lat},{lon}) radius={radius_km}km")
             set_job(progress=f"Discovery {i}/{len(centers)} tiles…")
             nearby = fetch_nearby_all_pages(gmaps_client, (lat, lon), int(radius_km*1000), type_="dentist")
+            print(f"Tile {i}: found {len(nearby)} clinics")
             for pl in nearby:
                 pid = pl.get("place_id")
                 if pid and pid not in place_ids:
                     place_ids[pid] = pl
                     if len(place_ids) >= max_total_places: break
             if len(place_ids) >= max_total_places: break
+        print("Total clinics found:", len(place_ids))
         if not place_ids:
             set_job(running=False, error="No clinics found.", progress="Stopped")
             return
@@ -413,6 +421,7 @@ def run_job(args):
                     progress_cb=None,
                     practice_name=practice
                 )
+            print(f"Row for {practice} | {site}: principal={principal} owner={owner} founder={founder} emails={emails} mobiles={mobiles} mobile_owners={mobile_owners}")
             return {
                 "Practice": practice or "",
                 "Address": addr or "",
@@ -450,15 +459,18 @@ def run_job(args):
                         job["current"] += 1
                 idx += len(batch)
                 set_job(progress=f"Scraping {job['current']}/{len(ids)}…")
+        print("Rows buffer length:", len(rows_buffer))
         df = pd.DataFrame(rows_buffer)
         if "Place ID" in df.columns:
             df = df.drop_duplicates(subset=["Place ID"]).reset_index(drop=True)
+        print("DataFrame length:", len(df))
         buf = io.BytesIO()
         df.to_csv(buf, index=False)
         buf.seek(0)
         set_job(running=False, progress=f"Done. {len(df)} clinics.",
                 rows=df.to_dict("records"), csv_bytes=buf.read(), error="")
     except Exception as e:
+        print("Crash!", e)
         set_job(running=False, error=f"Crash: {type(e).__name__}: {e}", progress="Stopped")
 
 @app.callback(
@@ -532,7 +544,6 @@ def do_download(n):
 
 def fetch_nearby_all_pages(gmaps_client, center, radius_m, type_="dentist"):
     out = []
-    # OPTIMIZED: Also search 'dental_clinic' type for more results and deduplicate
     for place_type in [type_, "dental_clinic"]:
         page_token = None
         tries = 0
@@ -553,7 +564,6 @@ def fetch_nearby_all_pages(gmaps_client, center, radius_m, type_="dentist"):
                 if tries > RETRIES:
                     break
                 time.sleep(0.8 * (2 ** tries) + random.random() * JITTER)
-    # Remove duplicates by place_id
     dedup = {}
     for pl in out:
         pid = pl.get("place_id")
