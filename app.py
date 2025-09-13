@@ -133,7 +133,7 @@ def http_get(url: str):
     return None, url
 
 # ==========================
-# Email extraction
+# Email extraction (stricter)
 # ==========================
 def extract_emails(soup: BeautifulSoup):
     found = set()
@@ -171,7 +171,7 @@ def extract_emails(soup: BeautifulSoup):
     return set(found)
 
 # ==========================
-# Principal / owner extraction
+# Principal / owner extraction (creative)
 # ==========================
 NAME_RE = re.compile(r"^(?:Dr\.?\s*)?[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}$")
 DR_NAME_RE = re.compile(r"(Dr\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})")
@@ -192,8 +192,16 @@ def role_is_ok(role_text: str) -> bool:
         return False
     return any(ok in t for ok in ROLE_OK)
 
+def try_match_name_to_practice(practice_name, staff_names):
+    # Try to match last name in practice name to staff names
+    pn = practice_name.lower().replace("dental", "").replace("clinic", "").strip()
+    for name in staff_names:
+        last = name.split()[-1].lower()
+        if last in pn:
+            return name
+    return ""
+
 def nearby_text(node) -> str:
-    # collect text from node and small neighborhood
     bits = [node.get_text(" ", strip=True)]
     parent = node.parent
     if parent:
@@ -210,11 +218,9 @@ def find_principal_in_structured_data(soup: BeautifulSoup):
             data = json.loads(tag.string or "")
         except Exception:
             continue
-        # normalize to list
         items = data if isinstance(data, list) else [data]
         for it in items:
             if not isinstance(it, dict): continue
-            # handle @graph or single
             graphs = it.get("@graph") if isinstance(it.get("@graph"), list) else [it]
             for obj in graphs:
                 if not isinstance(obj, dict): continue
@@ -225,28 +231,47 @@ def find_principal_in_structured_data(soup: BeautifulSoup):
                         m = DR_NAME_RE.search(name)
                         if m:
                             return normalize_name(m.group(1))
-                        # allow non Dr names if they clearly say owner
                         if "owner" in str(job).lower():
                             return normalize_name(name)
     return ""
 
-def find_principal_on_team_like_pages(soup: BeautifulSoup):
-    # target obvious blocks first
+def find_team_names(soup: BeautifulSoup):
+    team_names = []
+    team_like = soup.find_all(class_=lambda c: c and any(k in c.lower() for k in [
+        "team", "staff", "doctor", "dentist", "people", "provider", "bio", "profile", "member", "card"
+    ]))
+    for block in team_like:
+        text = block.get_text(" ", strip=True)
+        m = DR_NAME_RE.search(text)
+        if m:
+            team_names.append(normalize_name(m.group(1)))
+        else:
+            for h in block.find_all(["h1","h2","h3","h4","strong","b"]):
+                ht = norm_space(h.get_text(" ", strip=True))
+                if DR_NAME_RE.search(ht):
+                    team_names.append(normalize_name(DR_NAME_RE.search(ht).group(1)))
+    return team_names
+
+def find_principal_on_team_like_pages(soup: BeautifulSoup, practice_name=""):
     candidates = []
 
-    # any element whose class hints at team or staff
+    team_names = find_team_names(soup)
+    # Creative: Try last name in practice name
+    matched = try_match_name_to_practice(practice_name, team_names)
+    if matched:
+        return matched
+
+    # Normal role-based scan
     team_like = soup.find_all(class_=lambda c: c and any(k in c.lower() for k in [
         "team","staff","doctor","dentist","people","provider","bio","profile","member","card"
     ]))
     for block in team_like:
         text = block.get_text(" ", strip=True)
-        # try to pick a name within the block
         name = ""
         m = DR_NAME_RE.search(text)
         if m:
             name = normalize_name(m.group(1))
         else:
-            # sometimes name is in headings
             for h in block.find_all(["h1","h2","h3","h4","strong","b"]):
                 ht = norm_space(h.get_text(" ", strip=True))
                 if DR_NAME_RE.search(ht):
@@ -256,12 +281,11 @@ def find_principal_on_team_like_pages(soup: BeautifulSoup):
         if not name:
             continue
 
-        # find role text near the name
         vicinity = nearby_text(block)
         if role_is_ok(vicinity):
             candidates.append(name)
 
-    # headings and labels across the page
+    # Heuristic: if About/History page is present, look for named founder/owner
     for h in soup.find_all(["h1","h2","h3","h4","strong","b","p","li","span"]):
         t = norm_space(h.get_text(" ", strip=True))
         m = DR_NAME_RE.search(t)
@@ -271,22 +295,28 @@ def find_principal_on_team_like_pages(soup: BeautifulSoup):
         if role_is_ok(t):
             candidates.append(name)
 
-    # pick first stable candidate if any
-    return candidates[0] if candidates else ""
+    if candidates:
+        return candidates[0]
+    # Fall back to matching team name to practice name
+    if team_names:
+        matched = try_match_name_to_practice(practice_name, team_names)
+        if matched:
+            return matched
+        return team_names[0]
+    return ""
 
-def guess_principal_strict(soup: BeautifulSoup) -> str:
-    # 1) structured data first
+def guess_principal_creative(soup: BeautifulSoup, practice_name="") -> str:
+    # 1) Structured data first
     name = find_principal_in_structured_data(soup)
     if name:
         return name
-    # 2) team-like layout with role labels
-    name = find_principal_on_team_like_pages(soup)
+    # 2) Team-like layout with role labels and creative name matching
+    name = find_principal_on_team_like_pages(soup, practice_name)
     if name:
         return name
 
-    # 3) text patterns like "Principal Dentist: Dr X", "Practice Owner Dr X"
+    # 3) Text patterns like "Principal Dentist: Dr X", "Practice Owner Dr X"
     text = soup.get_text(" ", strip=True)
-    # pattern with roles around the name
     pat1 = re.compile(
         r"(Dr\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\s*[,|\-]?\s*(Principal\s+Dentist|Practice\s+Owner|Owner|Lead\s+Dentist|Clinical\s+Director)",
         re.I
@@ -304,7 +334,13 @@ def guess_principal_strict(soup: BeautifulSoup) -> str:
     if m:
         return normalize_name(m.group(2))
 
-    # Do NOT fall back to "any Dr" anymore
+    # Fallback: match any team name to practice
+    team_names = find_team_names(soup)
+    matched = try_match_name_to_practice(practice_name, team_names)
+    if matched:
+        return matched
+    if team_names:
+        return team_names[0]
     return ""
 
 # ==========================
@@ -354,7 +390,7 @@ def sitemap_seed(base_url):
 # ==========================
 # Full-site crawler (bounded)
 # ==========================
-def crawl_site(site_url: str, max_pages: int, max_seconds: int, progress_cb=None):
+def crawl_site(site_url: str, max_pages: int, max_seconds: int, progress_cb=None, practice_name=None):
     t0 = time.time()
     html, canon = http_get(site_url)
     if not html: return "", set(), "", site_url
@@ -387,9 +423,9 @@ def crawl_site(site_url: str, max_pages: int, max_seconds: int, progress_cb=None
             email_src.setdefault(e, final_url)
         emails |= found
 
-        # strict principal detection only when role is present
+        # creative principal detection only when role is present
         if not principal:
-            g = guess_principal_strict(soup)
+            g = guess_principal_creative(soup, practice_name)
             if g:
                 principal, principal_src = g, final_url
 
@@ -635,7 +671,8 @@ def run_job(args):
                     site,
                     max_pages=int(args.get("max_pages_per_site", 80)),
                     max_seconds=int(args.get("max_seconds_per_site", 90)),
-                    progress_cb=None
+                    progress_cb=None,
+                    practice_name=practice
                 )
 
             return {
