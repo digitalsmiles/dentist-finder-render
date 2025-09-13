@@ -154,17 +154,6 @@ def extract_emails(soup: BeautifulSoup):
                 found.add(addr)
     return set(found)
 
-def extract_mobiles(text):
-    matches = MOBILE_RE.findall(text)
-    cleaned = []
-    for m in matches:
-        number = re.sub(r"\D", "", m[0])
-        if number.startswith("61") and len(number) == 11:
-            number = "0" + number[2:]
-        if number.startswith("04") and len(number) == 10:
-            cleaned.append(number)
-    return list(set(cleaned))
-
 def norm_space(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
 
@@ -226,14 +215,33 @@ def find_principal_by_dr_pattern(soup: BeautifulSoup):
     seen = set()
     return [normalize_name(m) for m in matches if m not in seen and not seen.add(m)]
 
+def extract_mobiles_and_owners(soup, page_url):
+    results = []
+    text = soup.get_text(" ", strip=True)
+    matches = list(MOBILE_RE.finditer(text))
+    for m in matches:
+        mobile = re.sub(r"\D", "", m.group(0))
+        owner = ""
+        before = text[:m.start()]
+        dr_match = re.findall(r"(Dr\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})", before[-120:])
+        if dr_match:
+            owner = normalize_name(dr_match[-1])
+        results.append({
+            "mobile": mobile,
+            "owner": owner,
+            "source": page_url
+        })
+    return results
+
 def crawl_site(site_url: str, max_pages: int, max_seconds: int, progress_cb=None, practice_name=None):
     t0 = time.time()
     html, canon = http_get(site_url)
-    if not html: return "", set(), "", site_url, "", "", ""
+    if not html: return "", set(), "", site_url, "", "", "", "", ""
     queue, seen = deque(), set()
     queue.append(canon); seen.add(canon)
     principal_candidates, owners, founders = [], [], []
     emails, email_src = set(), {}
+    mobile_records = []
     pages_scanned = 0
     while queue and pages_scanned < max_pages and (time.time() - t0) < max_seconds:
         url = queue.popleft()
@@ -247,10 +255,10 @@ def crawl_site(site_url: str, max_pages: int, max_seconds: int, progress_cb=None
         for e in found:
             email_src.setdefault(e, final_url)
         emails |= found
-        page_text = soup.get_text(" ", strip=True)
         principal_candidates += find_principal_by_dr_pattern(soup)
         owners += find_people_by_role(soup, ROLE_OWNER)
         founders += find_people_by_role(soup, ROLE_FOUNDER)
+        mobile_records += extract_mobiles_and_owners(soup, final_url)
         internal = []
         for a in soup.find_all("a", href=True):
             u = normalize_abs(final_url, a["href"])
@@ -267,17 +275,23 @@ def crawl_site(site_url: str, max_pages: int, max_seconds: int, progress_cb=None
     first_email_source = ""
     if first_email:
         first_email_source = email_src.get(first_email, "")
+    mobiles = [rec["mobile"] for rec in mobile_records]
+    mobile_owners = [rec["owner"] for rec in mobile_records]
+    mobile_sources = [rec["source"] for rec in mobile_records]
     return (
         ", ".join(principal_candidates) if principal_candidates else "",
         emails,
         first_email_source,
         site_url,
         ", ".join(owners) if owners else "",
-        ", ".join(founders) if founders else ""
+        ", ".join(founders) if founders else "",
+        ", ".join(mobiles) if mobiles else "",
+        ", ".join(mobile_owners) if mobile_owners else "",
+        ", ".join(mobile_sources) if mobile_sources else ""
     )
 
 # ==========================
-# Rest of Dash app and worker logic unchanged, just add Owner and Founder columns
+# Dash app & UI
 # ==========================
 job = {
     "running": False, "progress": "Ready", "current": 0, "total": 0,
@@ -393,9 +407,9 @@ def run_job(args):
             practice = r.get("name")
             addr = r.get("formatted_address")
             site = (r.get("website") or "").strip()
-            principal, emails, email_src, principal_src, owner, founder = ("", set(), "", "", "", "")
+            principal, emails, email_src, principal_src, owner, founder, mobiles, mobile_owners, mobile_sources = ("", set(), "", "", "", "", "", "", "", "")
             if site:
-                principal, emails, email_src, principal_src, owner, founder = crawl_site(
+                principal, emails, email_src, principal_src, owner, founder, mobiles, mobile_owners, mobile_sources = crawl_site(
                     site,
                     max_pages=max_pages_per_site,
                     max_seconds=max_seconds_per_site,
@@ -409,6 +423,9 @@ def run_job(args):
                 "Principal / Owner (guess)": principal,
                 "Owner(s)": owner,
                 "Founder(s)": founder,
+                "Personal Mobiles": mobiles,
+                "Mobile Owner": mobile_owners,
+                "Mobile Source": mobile_sources,
                 "Emails found": ", ".join(sorted(emails)) if emails else "",
                 "First email source": email_src,
                 "Principal source": principal_src or site,
@@ -424,10 +441,12 @@ def run_job(args):
                         row = fut.result(timeout=PLACE_TIMEOUT)
                     except FuturesTimeout:
                         row = {"Practice":"","Address":"","Website":"","Principal / Owner (guess)":"",
-                               "Owner(s)":"","Founder(s)":"","Emails found":"","First email source":"","Principal source":"", "Place ID": futures[fut], "Error": f"Timeout after {PLACE_TIMEOUT}s"}
+                               "Owner(s)":"","Founder(s)":"","Personal Mobiles":"","Mobile Owner":"","Mobile Source":"",
+                               "Emails found":"","First email source":"","Principal source":"", "Place ID": futures[fut], "Error": f"Timeout after {PLACE_TIMEOUT}s"}
                     except Exception as e:
                         row = {"Practice":"","Address":"","Website":"","Principal / Owner (guess)":"",
-                               "Owner(s)":"","Founder(s)":"","Emails found":"","First email source":"","Principal source":"", "Place ID": futures[fut], "Error": f"{type(e).__name__}: {e}"}
+                               "Owner(s)":"","Founder(s)":"","Personal Mobiles":"","Mobile Owner":"","Mobile Source":"",
+                               "Emails found":"","First email source":"","Principal source":"", "Place ID": futures[fut], "Error": f"{type(e).__name__}: {e}"}
                     if row.get("Website") or row.get("Emails found") or row.get("Principal / Owner (guess)"):
                         rows_buffer.append(row)
                     with job_lock:
@@ -513,6 +532,81 @@ def do_download(n):
     if not data:
         return no_update
     return dcc.send_bytes(lambda b: b.write(data), "dental_clinics_with_emails.csv")
+
+# ========== Google helpers, grid, etc. unchanged ==========
+
+def fetch_nearby_all_pages(gmaps_client, center, radius_m, type_="dentist"):
+    out = []
+    for attempt in range(RETRIES + 1):
+        try:
+            resp = gmaps_client.places_nearby(location=center, radius=radius_m, type=type_)
+            out.extend(resp.get("results", []))
+            while "next_page_token" in resp:
+                time.sleep(NEARBY_SLEEP + random.random() * JITTER)
+                resp = gmaps_client.places_nearby(location=center, radius=radius_m, type=type_, page_token=resp["next_page_token"])
+                out.extend(resp.get("results", []))
+            return out
+        except Exception:
+            time.sleep(0.6 * (2 ** attempt) + random.random() * JITTER)
+    return out
+
+def gmaps_place_details(gmaps_client, place_id):
+    for attempt in range(RETRIES + 1):
+        try:
+            return gmaps_client.place(place_id=place_id, fields=["name","formatted_address","website"])
+        except Exception:
+            time.sleep(0.6 * (2 ** attempt) + random.random() * JITTER)
+    return {"result": {}}
+
+def km_to_deg(lat_deg: float, km: float):
+    deg_lat = km / 111.0
+    deg_lon = km / (111.320 * math.cos(math.radians(lat_deg)) or 1e-6)
+    return deg_lat, deg_lon
+
+def make_grid(north, south, east, west, radius_km, step_factor=1.6):
+    mid_lat = (north + south) / 2.0
+    step_km = radius_km * step_factor
+    dlat, dlon = km_to_deg(mid_lat, step_km)
+    lat = south + dlat/2.0
+    while lat < north:
+        lon = west + dlon/2.0
+        while lon < east:
+            yield (lat, lon)
+            lon += dlon
+        lat += dlat
+
+def sort_center_out(points, center_lat, center_lon):
+    def key(pt):
+        lat, lon = pt
+        dx = (lon - center_lon) * math.cos(math.radians(center_lat))
+        dy = (lat - center_lat)
+        return dx*dx + dy*dy
+    return sorted(points, key=key)
+
+def geocode_viewport(gmaps_client, place_text: str):
+    g = None
+    for attempt in range(RETRIES + 1):
+        try:
+            g = gmaps_client.geocode(place_text, region="au")
+            break
+        except Exception:
+            time.sleep(0.6 * (2 ** attempt) + random.random() * JITTER)
+    if not g: return None
+    res = g[0]
+    geom = res.get("geometry", {})
+    vp = geom.get("viewport")
+    if vp:
+        ne = vp.get("northeast", {}); sw = vp.get("southwest", {})
+        north, south = float(ne.get("lat")), float(sw.get("lat"))
+        east, west   = float(ne.get("lng")), float(sw.get("lng"))
+        north, south = max(north, south), min(north, south)
+        east, west   = max(east, west),   min(east, west)
+        return north, south, east, west
+    loc = geom.get("location")
+    if not loc: return None
+    lat, lng = float(loc["lat"]), float(loc["lng"])
+    dlat, dlon = km_to_deg(lat, 50.0)
+    return lat + dlat, lat - dlat, lng + dlon, lng - dlon
 
 if __name__ == "__main__":
     print("GOOGLE_API_KEY set?" , bool(os.getenv("GOOGLE_API_KEY")))
