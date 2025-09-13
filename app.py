@@ -2,6 +2,7 @@ import os, re, time, math, json, random, unicodedata, threading, io
 from urllib.parse import urljoin, urlparse
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+from email.utils import parseaddr
 
 import requests
 import pandas as pd
@@ -44,12 +45,30 @@ LIKELY_PATH_HINTS = [
 ]
 
 EMAIL_RE = re.compile(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", re.I)
-AT_VARIANTS = r"(?:@|\s?[\[\(]{0,1}\s*at\s*[\]\)]{0,1}\s?)"
-DOT_VARIANTS = r"(?:\.|\s?dot\s?)"
+AT_VARIANTS = r"(?:@|\s+at\s+)"
+DOT_VARIANTS = r"(?:\.|\s+dot\s+)"
 OBFUSCATED_EMAIL_RE = re.compile(
-    rf"([A-Z0-9._%+\-]+)\s*{AT_VARIANTS}\s*([A-Z0-9.\-]+)\s*{DOT_VARIANTS}\s*([A-Z]{{2,}})",
+    rf"\b([A-Z0-9._%+\-]+)\s*{AT_VARIANTS}\s*([A-Z0-9.\-]+)\s*{DOT_VARIANTS}\s*([A-Z]{{2,10}})\b",
     re.I
 )
+
+# Comprehensive list of valid TLDs (2-10 characters) 
+VALID_TLDS = {
+    # Generic TLDs
+    'com', 'org', 'net', 'edu', 'gov', 'mil', 'int', 'biz', 'info', 'name', 'pro', 'coop', 'aero', 'museum',
+    # Country code TLDs (major ones)
+    'au', 'uk', 'us', 'ca', 'fr', 'de', 'jp', 'cn', 'br', 'ru', 'in', 'it', 'es', 'nl', 'se', 'no', 'dk', 'ch', 'at', 'be',
+    # Additional popular TLDs
+    'co', 'io', 'ai', 'tv', 'me', 'cc', 'ly', 'ws', 'to', 'la', 'gg', 'ag', 'am', 'fm', 'md', 'tk', 'ml', 'ga', 'cf',
+    # New gTLDs (popular ones)
+    'app', 'dev', 'tech', 'blog', 'news', 'shop', 'store', 'online', 'site', 'website', 'space', 'club', 'world', 'life',
+    # Extended country codes and regional
+    'com.au', 'co.uk', 'co.nz', 'co.za', 'com.br', 'co.jp', 'co.in', 'com.mx', 'com.ar', 'com.sg', 'com.my', 'com.hk',
+    'org.uk', 'net.au', 'org.au', 'edu.au', 'gov.au', 'asn.au', 'id.au'
+}
+
+# More robust email regex that requires proper structure
+STRICT_EMAIL_RE = re.compile(r"^[A-Z0-9]([A-Z0-9._%+\-]*[A-Z0-9])?@[A-Z0-9]([A-Z0-9.\-]*[A-Z0-9])?\.[A-Z]{2,10}$", re.I)
 
 # Roles we will accept as "principal / owner"
 ROLE_OK = [
@@ -133,29 +152,94 @@ def http_get(url: str):
     return None, url
 
 # ==========================
+# Email validation helpers
+# ==========================
+def is_valid_email(email: str) -> bool:
+    """
+    Validate email using multiple checks:
+    1. Basic structure check
+    2. TLD validation 
+    3. email.utils.parseaddr validation
+    4. Filter out obvious junk
+    """
+    if not email or len(email) < 5:
+        return False
+    
+    # Remove obvious junk patterns
+    email_lower = email.lower()
+    
+    # Filter out image files and other non-email extensions
+    junk_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.svg', '.webp', '.pdf', '.doc', '.docx', 
+                      '.zip', '.rar', '.mp4', '.avi', '.mov', '.css', '.js', '.html', '.htm']
+    if any(email_lower.endswith(ext) for ext in junk_extensions):
+        return False
+    
+    # Filter out obvious non-email patterns
+    if any(pattern in email_lower for pattern in ['script', 'function', 'window', 'document', 'var ']):
+        return False
+    
+    # Must match strict email format
+    if not STRICT_EMAIL_RE.match(email):
+        return False
+    
+    # Extract TLD for validation
+    tld = email.split('.')[-1].lower()
+    if tld not in VALID_TLDS:
+        return False
+    
+    # Use email.utils.parseaddr for additional validation
+    name, addr = parseaddr(email)
+    if not addr or addr != email:
+        return False
+    
+    # Additional sanity checks
+    if email.count('@') != 1:
+        return False
+    
+    local, domain = email.split('@')
+    if not local or not domain or len(local) > 64 or len(domain) > 255:
+        return False
+    
+    # Domain must have at least one dot
+    if '.' not in domain:
+        return False
+    
+    return True
+
+# ==========================
 # Email extraction
 # ==========================
 def extract_emails(soup: BeautifulSoup):
     found = set()
-    # strict mailto first
+    
+    # Extract from mailto links first (most reliable)
     for a in soup.select("a[href^='mailto:']"):
         addr = a.get("href","").split("mailto:")[-1].split("?")[0].strip()
-        if EMAIL_RE.fullmatch(addr): found.add(addr.lower())
+        if is_valid_email(addr):
+            found.add(addr.lower())
 
-    # visible text only
+    # Extract from visible text - use word boundaries to avoid partial matches
     text = soup.get_text(" ", strip=True)
-    for m in EMAIL_RE.finditer(text):
-        e = m.group(0).lower()
-        # drop obvious file-like junk
-        if any(e.endswith(ext) for ext in [".jpg",".jpeg",".png",".gif",".svg",".webp"]):
-            continue
-        found.add(e)
+    # Use word boundaries to prevent matching across words like "patients.in"
+    for m in re.finditer(r'\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b', text, re.I):
+        candidate = m.group(0).lower()
+        if is_valid_email(candidate):
+            found.add(candidate)
 
-    # obfuscated forms like "info at domain dot com"
+    # Handle obfuscated forms like "info at domain dot com" and "user at site dot co dot uk"
     for m in OBFUSCATED_EMAIL_RE.finditer(text):
         user, domain, tld = m.groups()
         addr = f"{user}@{domain}.{tld}".lower()
-        if EMAIL_RE.fullmatch(addr): found.add(addr)
+        if is_valid_email(addr):
+            found.add(addr)
+    
+    # Additional check for multi-part TLDs in obfuscated format like "co dot uk"
+    multi_tld_pattern = r'\b([A-Z0-9._%+\-]+)\s+at\s+([A-Z0-9.\-]+)\s+dot\s+(\w+)\s+dot\s+(\w+)\b'
+    for m in re.finditer(multi_tld_pattern, text, re.I):
+        user, domain, tld1, tld2 = m.groups()
+        addr = f"{user}@{domain}.{tld1}.{tld2}".lower()
+        if is_valid_email(addr):
+            found.add(addr)
 
     return found
 
