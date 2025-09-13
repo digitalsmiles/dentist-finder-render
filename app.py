@@ -131,6 +131,17 @@ def cache_set_details(place_id, data):
     _save_cache(DETAILS_CACHE_PATH, DETAILS_CACHE)
 
 # ==========================
+# STOP control (NEW)
+# ==========================
+STOP_EVENT = threading.Event()
+
+def request_stop():
+    STOP_EVENT.set()
+
+def clear_stop():
+    STOP_EVENT.clear()
+
+# ==========================
 # Helpers
 # ==========================
 def same_site(a, b):
@@ -149,6 +160,7 @@ def normalize_abs(base, href):
 def http_get(url: str):
     last_url = url
     for i in range(RETRIES + 1):
+        if STOP_EVENT.is_set(): return None, last_url
         try:
             r = SESSION.get(url, timeout=TIMEOUT, allow_redirects=True, stream=True)
             last_url = r.url
@@ -162,6 +174,7 @@ def http_get(url: str):
                 return None, last_url
             chunks, total = [], 0
             for chunk in r.iter_content(chunk_size=16384, decode_unicode=True):
+                if STOP_EVENT.is_set(): return None, last_url
                 if chunk:
                     if isinstance(chunk, bytes):
                         try: chunk = chunk.decode(errors="ignore")
@@ -241,6 +254,7 @@ def extract_mobiles(text):
 def find_people_by_role(soup: BeautifulSoup, role_list):
     people = []
     for tag in soup.find_all(["h1","h2","h3","h4","strong","b","p","li","span","div"]):
+        if STOP_EVENT.is_set(): break
         t = norm_space(tag.get_text(" ", strip=True))
         if not t: continue
         m = DR_NAME_RE.search(t)
@@ -253,6 +267,7 @@ def find_people_by_role(soup: BeautifulSoup, role_list):
             if m2:
                 people.append(normalize_name(m2.group(1)))
     for tag in soup.find_all("script", type=lambda t: t and "ld+json" in t):
+        if STOP_EVENT.is_set(): break
         try:
             data = json.loads(tag.string or "")
         except Exception:
@@ -305,14 +320,14 @@ def extract_mobiles_with_context(soup: BeautifulSoup, page_url: str):
 def crawl_site(site_url: str, max_pages: int, max_seconds: int, progress_cb=None, practice_name=None):
     t0 = time.time()
     html, canon = http_get(site_url)
-    if not html: return "", set(), "", site_url, "", "", []
+    if not html or STOP_EVENT.is_set(): return "", set(), "", site_url, "", "", []
     queue, seen = deque(), set()
     queue.append(canon); seen.add(canon)
     principal_candidates, owners, founders = [], [], []
     emails, email_src = set(), {}
     mobiles_all = []
     pages_scanned = 0
-    while queue and pages_scanned < max_pages and (time.time() - t0) < max_seconds:
+    while queue and pages_scanned < max_pages and (time.time() - t0) < max_seconds and not STOP_EVENT.is_set():
         url = queue.popleft()
         pages_scanned += 1
         html, final_url = http_get(url)
@@ -378,6 +393,7 @@ def km_to_deg(lat_deg: float, km: float):
 def geocode_viewport(gmaps_client, place_text: str):
     g = None
     for attempt in range(RETRIES + 1):
+        if STOP_EVENT.is_set(): return None
         try:
             g = gmaps_client.geocode(place_text, region="au")
             break
@@ -435,6 +451,7 @@ def fetch_nearby_all_pages(gmaps_client, center, radius_m, types=("dentist","den
         tries = 0
         pages = 0
         while True:
+            if STOP_EVENT.is_set(): break
             if nearby_calls >= MAX_NEARBY_CALLS: break
             if pages >= MAX_NEARBY_PAGES_PER_TILE: break
             try:
@@ -477,12 +494,12 @@ def gmaps_place_details(gmaps_client, place_id):
         return {"result": {"place_id": place_id}}
 
     for attempt in range(RETRIES + 1):
+        if STOP_EVENT.is_set(): return {"result": {"place_id": place_id}}
         try:
             resp = gmaps_client.place(place_id=place_id,
                                       fields=["name","formatted_address","website","place_id"])
             r = resp.get("result", {}) or {}
             details_calls += 1
-            # cache only essential fields
             cache_set_details(place_id, {
                 "name": r.get("name",""),
                 "formatted_address": r.get("formatted_address",""),
@@ -511,6 +528,18 @@ def reset_job():
     with job_lock:
         job.update({"running": False, "progress": "Ready", "current": 0, "total": 0,
                     "rows": [], "csv_bytes": b"", "error": "", "diag": ""})
+
+def snapshot_csv(rows):
+    """Save current rows to job['rows'] and job['csv_bytes'] for download."""
+    df = pd.DataFrame(rows)
+    if "Place ID" in df.columns:
+        df = df.drop_duplicates(subset=["Place ID"]).reset_index(drop=True)
+    buf = io.BytesIO()
+    df.to_csv(buf, index=False)
+    buf.seek(0)
+    with job_lock:
+        job["rows"] = df.to_dict("records")
+        job["csv_bytes"] = buf.read()
 
 # ==========================
 # Dash app
@@ -542,7 +571,10 @@ app.layout = html.Div(
                       dcc.Input(id="max_seconds_per_site", type="number", value=60, step=5)]),
         ], style={"marginTop":"8px","display":"grid","gridTemplateColumns":"repeat(2, minmax(220px,1fr))","gap":"10px"}),
         html.Br(),
-        html.Button("Start sweep", id="start", n_clicks=0, style={"padding":"8px 14px"}),
+        html.Div([
+            html.Button("Start sweep", id="start", n_clicks=0, style={"padding":"8px 14px","marginRight":"8px"}),
+            html.Button("Stop", id="stop", n_clicks=0, style={"padding":"8px 14px","background":"#c33","color":"#fff"}),
+        ]),
         html.Span(id="status", style={"marginLeft":"12px"}),
         html.Div(id="diag", style={"marginTop":"6px", "fontSize":"12px", "opacity":0.8}),
         html.Div(style={"height":"14px"}),
@@ -569,6 +601,7 @@ def run_job(args):
     global nearby_calls, details_calls
     try:
         set_job(progress="Starting worker…", running=True, error="", diag="")
+        clear_stop()  # ensure STOP is clear for a fresh run
         nearby_calls = 0
         details_calls = 0
 
@@ -588,7 +621,7 @@ def run_job(args):
         max_seconds_per_site = int(args.get("max_seconds_per_site", 60))
 
         vp = geocode_viewport(gmaps_client, place_text)
-        if not vp:
+        if not vp or STOP_EVENT.is_set():
             set_job(running=False, error=f"Could not geocode: {place_text}", progress="Stopped")
             return
         north, south, east, west = vp
@@ -608,11 +641,14 @@ def run_job(args):
         place_ids = {}
         new_counts = deque(maxlen=EARLY_STOP_WINDOW)
 
+        # ---- DISCOVERY LOOP ----
         for i, (lat, lon) in enumerate(centers, start=1):
+            if STOP_EVENT.is_set(): break
             set_job(progress=f"Discovery {i}/{len(centers)} tiles…")
             before = len(place_ids)
             nearby = fetch_nearby_all_pages(gmaps_client, (lat, lon), int(radius_km*1000))
             for pl in nearby:
+                if STOP_EVENT.is_set(): break
                 pid = pl.get("place_id")
                 if pid and pid not in place_ids:
                     place_ids[pid] = pl
@@ -620,17 +656,19 @@ def run_job(args):
             gained = len(place_ids) - before
             new_counts.append(gained)
             set_job(diag=(job.get("diag","") + f" • tile{i}: +{gained} (unique {len(place_ids)})"))
-            if len(place_ids) >= max_total_places: break
-            # Early stop if recent tiles add too few uniques
+            if len(place_ids) >= max_total_places or nearby_calls >= MAX_NEARBY_CALLS:
+                break
             if len(new_counts) == EARLY_STOP_WINDOW and sum(new_counts) < EARLY_STOP_MIN_DELTA:
                 set_job(diag=(job.get("diag","") + " • early-stop grid"))
                 break
-            # Also stop if caps hit
-            if nearby_calls >= MAX_NEARBY_CALLS:
-                set_job(diag=(job.get("diag","") + " • nearby cap reached"))
-                break
 
         set_job(diag=(job.get("diag","") + f" • Nearby calls: {nearby_calls} • Unique places: {len(place_ids)}"))
+
+        if STOP_EVENT.is_set():
+            # Nothing processed into rows yet; snapshot empty with header
+            snapshot_csv([])
+            set_job(running=False, progress=f"Stopped early during discovery. Unique places found: {len(place_ids)}.")
+            return
 
         if not place_ids:
             set_job(running=False, error="No clinics found.", progress="Stopped")
@@ -660,7 +698,7 @@ def run_job(args):
             # - we have a site
             # - we haven’t exceeded MAX_SITES_TO_CRAWL
             # - and we haven’t crawled this domain already this run
-            if site and sites_crawled < MAX_SITES_TO_CRAWL:
+            if site and sites_crawled < MAX_SITES_TO_CRAWL and not STOP_EVENT.is_set():
                 dom = urlparse(site).netloc.lower()
                 if dom and dom not in seen_domains:
                     seen_domains.add(dom)
@@ -689,12 +727,15 @@ def run_job(args):
                 "Place ID": r.get("place_id") or pid
             }
 
+        # ---- DETAILS LOOP ----
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
             idx = 0
             while idx < len(ids):
+                if STOP_EVENT.is_set(): break
                 batch = ids[idx: min(idx + MAX_WORKERS, len(ids))]
                 futures = {pool.submit(worker, pid): pid for pid in batch}
                 for fut in futures:
+                    if STOP_EVENT.is_set(): break
                     try:
                         row = fut.result(timeout=PLACE_TIMEOUT)
                     except FuturesTimeout:
@@ -708,20 +749,24 @@ def run_job(args):
                                "Principal source":"", "Mobiles found":"","Mobile Name(s)":"","Mobile Source(s)":"",
                                "Place ID": futures[fut], "Error": f"{type(e).__name__}: {e}"}
                     rows_buffer.append(row)
+
+                    # Snapshot CSV & table progressively so Stop -> Download works immediately
+                    snapshot_csv(rows_buffer)
+
                     with job_lock:
                         job["current"] += 1
                 idx += len(batch)
                 set_job(progress=f"Scraping {job['current']}/{len(ids)}…")
 
-        df = pd.DataFrame(rows_buffer)
-        if "Place ID" in df.columns:
-            df = df.drop_duplicates(subset=["Place ID"]).reset_index(drop=True)
+        # If stopped mid-details, finalize with partial
+        if STOP_EVENT.is_set():
+            snapshot_csv(rows_buffer)
+            set_job(running=False, progress=f"Stopped early after processing {len(job['rows'])} clinics. (nearby={nearby_calls}, details={details_calls})")
+            return
 
-        buf = io.BytesIO()
-        df.to_csv(buf, index=False)
-        buf.seek(0)
-        set_job(running=False, progress=f"Done. {len(df)} clinics. (nearby={nearby_calls}, details={details_calls}, crawled={sites_crawled})",
-                rows=df.to_dict("records"), csv_bytes=buf.read(), error="")
+        # Normal end
+        snapshot_csv(rows_buffer)
+        set_job(running=False, progress=f"Done. {len(job['rows'])} clinics. (nearby={nearby_calls}, details={details_calls})", error="")
     except Exception as e:
         set_job(running=False, error=f"Crash: {type(e).__name__}: {e}", progress="Stopped")
 
@@ -772,6 +817,7 @@ def start(n, place_text, radius_km, step_factor, max_tiles, max_total_places,
         set_job(diag="Job already running, wait for completion.", progress=job.get("progress", "Busy"))
         return {"msg":"already_running", "ts": time.time()}
     reset_job()
+    clear_stop()
     set_job(running=True, progress="Starting…", current=0, total=0, rows=[], error="", diag="launching thread")
     args = {
         "place_text": place_text or "Brisbane QLD",
@@ -784,6 +830,18 @@ def start(n, place_text, radius_km, step_factor, max_tiles, max_total_places,
     }
     threading.Thread(target=run_job, args=(args,), daemon=True).start()
     return {"msg":"started", "ts": time.time()}
+
+# NEW: Stop button callback — sets stop flag
+@app.callback(
+    Output("diag","children", allow_duplicate=True),
+    Input("stop","n_clicks"),
+    prevent_initial_call=True
+)
+def stop_clicked(n):
+    if not n:
+        return no_update
+    request_stop()
+    return (job.get("diag","") + " • stop requested")
 
 @app.callback(
     Output("download","data"),
