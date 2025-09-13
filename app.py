@@ -64,6 +64,9 @@ ROLE_BLOCK = [
 
 DR_NAME_RE = re.compile(r"(Dr\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})")
 
+# ==========================
+# HTTP session
+# ==========================
 def make_session():
     s = requests.Session()
     retry = Retry(
@@ -80,6 +83,9 @@ def make_session():
 
 SESSION = make_session()
 
+# ==========================
+# Utils
+# ==========================
 def slugify(s: str):
     s = unicodedata.normalize("NFKD", s).encode("ascii","ignore").decode("ascii")
     s = re.sub(r"[^A-Za-z0-9]+","_", s).strip("_")
@@ -99,17 +105,19 @@ def normalize_abs(base, href):
     return u._replace(fragment="").geturl()
 
 def http_get(url: str):
+    last_url = url
     for i in range(RETRIES + 1):
         try:
             r = SESSION.get(url, timeout=TIMEOUT, allow_redirects=True, stream=True)
+            last_url = r.url
             if not r.ok:
                 raise requests.RequestException(f"HTTP {r.status_code}")
             ctype = (r.headers.get("Content-Type","") or "").lower()
             if ("text/html" not in ctype) and ("xml" not in ctype):
-                return None, url
+                return None, last_url
             clen = r.headers.get("Content-Length")
             if clen and int(clen) > MAX_HTML_BYTES:
-                return None, url
+                return None, last_url
             chunks, total = [], 0
             for chunk in r.iter_content(chunk_size=16384, decode_unicode=True):
                 if chunk:
@@ -121,12 +129,45 @@ def http_get(url: str):
                     chunks.append(chunk)
                     total += len(chunk)
                     if total > MAX_HTML_BYTES: break
-            return "".join(chunks), r.url
+            return "".join(chunks), last_url
         except requests.RequestException:
             pass
         time.sleep(0.4 * (2 ** i) + random.random() * JITTER)
-    return None, url
+    return None, last_url
 
+def norm_space(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
+
+def normalize_name(txt: str):
+    txt = norm_space(txt)
+    if re.match(r"(?i)^dr\.?\s+", txt):
+        txt = re.sub(r"(?i)^dr\.?\s*", "Dr ", txt).strip()
+    return txt
+
+def dedupe(seq):
+    seen = set()
+    out = []
+    for x in seq:
+        if not x: 
+            continue
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+def role_is(role_text: str, role_list):
+    t = role_text.lower()
+    for block_word in ROLE_BLOCK:
+        if block_word in t:
+            return False
+    for ok_word in role_list:
+        if ok_word in t:
+            return True
+    return False
+
+# ==========================
+# Content parsers
+# ==========================
 def extract_emails(soup: BeautifulSoup):
     found = set()
     for a in soup.select("a[href^='mailto:']"):
@@ -159,49 +200,28 @@ def extract_mobiles(text):
     cleaned = []
     for m in matches:
         number = re.sub(r"\D", "", m[0])
+        # normalise +61 to 04
         if number.startswith("61") and len(number) == 11:
             number = "0" + number[2:]
         if number.startswith("04") and len(number) == 10:
             cleaned.append(number)
     return list(set(cleaned))
 
-def norm_space(s: str) -> str:
-    return re.sub(r"\s+", " ", s or "").strip()
-
-def normalize_name(txt: str):
-    txt = norm_space(txt)
-    if re.match(r"(?i)^dr\.?\s+", txt):
-        txt = re.sub(r"(?i)^dr\.?\s*", "Dr ", txt).strip()
-    return txt
-
-def dedupe(names):
-    return list(dict.fromkeys([normalize_name(x) for x in names if x]))
-
-def role_is(role_text: str, role_list):
-    t = role_text.lower()
-    for block_word in ROLE_BLOCK:
-        if block_word in t:
-            return False
-    for ok_word in role_list:
-        if ok_word in t:
-            return True
-    return False
-
 def find_people_by_role(soup: BeautifulSoup, role_list):
     people = []
     for tag in soup.find_all(["h1","h2","h3","h4","strong","b","p","li","span","div"]):
         t = norm_space(tag.get_text(" ", strip=True))
-        if not t:
-            continue
+        if not t: continue
         m = DR_NAME_RE.search(t)
         name = m.group(1) if m else ""
         if name and role_is(t, role_list):
-            people.append(name)
+            people.append(normalize_name(name))
         for ok_word in role_list:
             pat = re.compile(rf"{ok_word}\s*[:\-]?\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)", re.I)
             m2 = pat.search(t)
             if m2:
                 people.append(normalize_name(m2.group(1)))
+    # JSON LD
     for tag in soup.find_all("script", type=lambda t: t and "ld+json" in t):
         try:
             data = json.loads(tag.string or "")
@@ -217,23 +237,70 @@ def find_people_by_role(soup: BeautifulSoup, role_list):
                 name = obj.get("name") or ""
                 if name and role_is(job, role_list):
                     people.append(normalize_name(name))
-    seen = set()
-    return [x for x in people if not (x in seen or seen.add(x))]
+    return dedupe(people)
 
 def find_principal_by_dr_pattern(soup: BeautifulSoup):
     text = soup.get_text(" ", strip=True)
     matches = DR_NAME_RE.findall(text)
-    seen = set()
-    return [normalize_name(m) for m in matches if m not in seen and not seen.add(m)]
+    return dedupe([normalize_name(m) for m in matches])
 
+# ===== Mobile extraction with context =====
+def extract_mobiles_with_context(soup: BeautifulSoup, page_url: str):
+    """
+    Returns a list of dicts: {mobile, name, source}
+    Heuristic:
+      1. Find all mobiles on the page text
+      2. For each mobile, search nearby for a Dr Name pattern
+      3. If not found nearby, fall back to first Dr on page or heading text
+    """
+    text = soup.get_text(" ", strip=True)
+    mobiles = extract_mobiles(text)
+    if not mobiles:
+        return []
+
+    # Pre collect possible names by role and by Dr pattern
+    names_role = set(find_people_by_role(soup, ROLE_OK) + find_people_by_role(soup, ROLE_OWNER))
+    names_dr = set(find_principal_by_dr_pattern(soup))
+    names_all = dedupe(list(names_role) + list(names_dr))
+
+    results = []
+    for num in mobiles:
+        person = ""
+        # search window around the number for nearest Dr name
+        idx = text.find(num[:4])  # use first 4 digits to anchor in case of formatting
+        if idx != -1:
+            start = max(0, idx - 160)
+            end = min(len(text), idx + 160)
+            window = text[start:end]
+            mwin = DR_NAME_RE.search(window)
+            if mwin:
+                person = normalize_name(mwin.group(1))
+        if not person and names_all:
+            # fallback to first known name found on page
+            person = names_all[0]
+        results.append({"mobile": num, "name": person, "source": page_url})
+    # de duplicate by mobile keeping first pairing
+    seen = set()
+    deduped = []
+    for r in results:
+        if r["mobile"] in seen:
+            continue
+        seen.add(r["mobile"])
+        deduped.append(r)
+    return deduped
+
+# ==========================
+# Site crawl
+# ==========================
 def crawl_site(site_url: str, max_pages: int, max_seconds: int, progress_cb=None, practice_name=None):
     t0 = time.time()
     html, canon = http_get(site_url)
-    if not html: return "", set(), "", site_url, "", "", ""
+    if not html: return "", set(), "", site_url, "", "", []
     queue, seen = deque(), set()
     queue.append(canon); seen.add(canon)
     principal_candidates, owners, founders = [], [], []
     emails, email_src = set(), {}
+    mobiles_all = []
     pages_scanned = 0
     while queue and pages_scanned < max_pages and (time.time() - t0) < max_seconds:
         url = queue.popleft()
@@ -243,14 +310,18 @@ def crawl_site(site_url: str, max_pages: int, max_seconds: int, progress_cb=None
             if progress_cb: progress_cb(pages_scanned, max_pages)
             continue
         soup = BeautifulSoup(html, "lxml")
-        found = extract_emails(soup)
-        for e in found:
+        # emails
+        found_emails = extract_emails(soup)
+        for e in found_emails:
             email_src.setdefault(e, final_url)
-        emails |= found
-        page_text = soup.get_text(" ", strip=True)
+        emails |= found_emails
+        # mobiles with context
+        mobiles_all.extend(extract_mobiles_with_context(soup, final_url))
+        # names
         principal_candidates += find_principal_by_dr_pattern(soup)
         owners += find_people_by_role(soup, ROLE_OWNER)
         founders += find_people_by_role(soup, ROLE_FOUNDER)
+        # internal links
         internal = []
         for a in soup.find_all("a", href=True):
             u = normalize_abs(final_url, a["href"])
@@ -260,24 +331,110 @@ def crawl_site(site_url: str, max_pages: int, max_seconds: int, progress_cb=None
             seen.add(u); queue.append(u)
         if progress_cb: progress_cb(pages_scanned, max_pages)
         time.sleep(CRAWL_SLEEP + random.random() * JITTER)
+
     principal_candidates = dedupe(principal_candidates)
     owners = dedupe(owners)
     founders = dedupe(founders)
+    # de duplicate mobiles by number
+    mob_map = {}
+    for m in mobiles_all:
+        mob_map.setdefault(m["mobile"], m)  # keep first found
+    mobiles_all = list(mob_map.values())
+
     first_email = next(iter(emails)) if emails else ""
-    first_email_source = ""
-    if first_email:
-        first_email_source = email_src.get(first_email, "")
+    first_email_source = email_src.get(first_email, "") if first_email else ""
+
     return (
         ", ".join(principal_candidates) if principal_candidates else "",
         emails,
         first_email_source,
         site_url,
         ", ".join(owners) if owners else "",
-        ", ".join(founders) if founders else ""
+        ", ".join(founders) if founders else "",
+        mobiles_all
     )
 
 # ==========================
-# Rest of Dash app and worker logic unchanged, just add Owner and Founder columns
+# Google Maps helpers
+# ==========================
+def geocode_viewport(gmaps_client: googlemaps.Client, place_text: str):
+    ge = gmaps_client.geocode(place_text)
+    if not ge: return None
+    # prefer viewport then bounds then location buffer
+    comp = ge[0]
+    if "geometry" not in comp: return None
+    geom = comp["geometry"]
+    if "viewport" in geom and geom["viewport"]:
+        vp = geom["viewport"]
+        n = vp["northeast"]["lat"]
+        s = vp["southwest"]["lat"]
+        e = vp["northeast"]["lng"]
+        w = vp["southwest"]["lng"]
+        return (n, s, e, w)
+    elif "bounds" in geom and geom["bounds"]:
+        b = geom["bounds"]
+        n = b["northeast"]["lat"]
+        s = b["southwest"]["lat"]
+        e = b["northeast"]["lng"]
+        w = b["southwest"]["lng"]
+        return (n, s, e, w)
+    # fallback small box around point
+    lat = geom["location"]["lat"]; lng = geom["location"]["lng"]
+    dlat = 0.1; dlng = 0.1
+    return (lat + dlat, lat - dlat, lng + dlng, lng - dlng)
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    R = 6371.0088
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1))*math.cos(math.radians(lat2))*math.sin(dlon/2)**2
+    return 2 * R * math.asin(math.sqrt(a))
+
+def make_grid(north, south, east, west, radius_km, step_factor):
+    """
+    Yields grid centers covering the viewport.
+    Step is radius_km / step_factor for overlap.
+    """
+    # rough degrees per km at given latitude
+    lat_mid = (north + south) / 2.0
+    km_per_deg_lat = 110.574
+    km_per_deg_lon = 111.320 * math.cos(math.radians(lat_mid))
+
+    step_km = max(0.2, radius_km / max(0.1, step_factor))
+    dlat = step_km / km_per_deg_lat
+    dlon = step_km / km_per_deg_lon
+
+    lat = south
+    while lat <= north:
+        lon = west
+        while lon <= east:
+            yield (lat, lon)
+            lon += dlon
+        lat += dlat
+
+def sort_center_out(points, center_lat, center_lon):
+    return sorted(points, key=lambda p: haversine_km(center_lat, center_lon, p[0], p[1]))
+
+def fetch_nearby_all_pages(gmaps_client: googlemaps.Client, center, radius_m, type_="dentist"):
+    out = []
+    params = dict(location=center, radius=radius_m, type=type_)
+    resp = gmaps_client.places_nearby(**params)
+    out.extend(resp.get("results", []))
+    token = resp.get("next_page_token")
+    # Google requires a short delay before using next_page_token
+    while token:
+        time.sleep(NEARBY_SLEEP)
+        resp = gmaps_client.places_nearby(page_token=token)
+        out.extend(resp.get("results", []))
+        token = resp.get("next_page_token")
+    return out
+
+def gmaps_place_details(gmaps_client: googlemaps.Client, place_id: str):
+    # fields limited to what we need
+    return gmaps_client.place(place_id=place_id, fields=["name","formatted_address","website","place_id"])
+
+# ==========================
+# Dash job state
 # ==========================
 job = {
     "running": False, "progress": "Ready", "current": 0, "total": 0,
@@ -297,6 +454,9 @@ def reset_job():
             "rows": [], "csv_bytes": b"", "error": "", "diag": ""
         })
 
+# ==========================
+# Dash app
+# ==========================
 app = Dash(__name__, title="Dental Finder (Dash)", suppress_callback_exceptions=True)
 server = app.server
 
@@ -312,7 +472,7 @@ app.layout = html.Div(
                       dcc.Input(id="radius_km", type="number", value=2.5, step=0.5)]),
             html.Div([html.Label("Tile overlap (step factor)"),
                       dcc.Input(id="step_factor", type="number", value=1.5, step=0.1)]),
-            html.Div([html.Label("Max tiles (center-out)"),
+            html.Div([html.Label("Max tiles (center out)"),
                       dcc.Input(id="max_tiles", type="number", value=200, step=10)]),
             html.Div([html.Label("Max clinics to collect"),
                       dcc.Input(id="max_total_places", type="number", value=3000, step=100)]),
@@ -344,6 +504,9 @@ app.layout = html.Div(
     ]
 )
 
+# ==========================
+# Worker
+# ==========================
 def run_job(args):
     try:
         set_job(progress="Starting worker…", running=True, error="", diag="")
@@ -360,17 +523,20 @@ def run_job(args):
         max_total_places = int(args.get("max_total_places", 3000))
         max_pages_per_site = int(args.get("max_pages_per_site", 80))
         max_seconds_per_site = int(args.get("max_seconds_per_site", 90))
+
         vp = geocode_viewport(gmaps_client, place_text)
         if not vp:
             set_job(running=False, error=f"Could not geocode: {place_text}", progress="Stopped")
             return
         north, south, east, west = vp
+
         centers_all = list(make_grid(north, south, east, west, radius_km, step_factor))
         center_lat = (north + south)/2.0
         center_lon = (east + west)/2.0
         centers_sorted = sort_center_out(centers_all, center_lat, center_lon)
         centers = centers_sorted[:max_tiles] if len(centers_sorted) > max_tiles else centers_sorted
         set_job(diag=f"Key: OK • Tiles planned: {len(centers)} • Max clinics: {max_total_places}")
+
         place_ids = {}
         for i, (lat, lon) in enumerate(centers, start=1):
             set_job(progress=f"Discovery {i}/{len(centers)} tiles…")
@@ -381,27 +547,32 @@ def run_job(args):
                     place_ids[pid] = pl
                     if len(place_ids) >= max_total_places: break
             if len(place_ids) >= max_total_places: break
+
         if not place_ids:
             set_job(running=False, error="No clinics found.", progress="Stopped")
             return
+
         ids = list(place_ids.keys())
         rows_buffer = []
         set_job(progress="Scraping details…", current=0, total=len(ids))
+
         def worker(pid):
             det = gmaps_place_details(gmaps_client, pid)
             r = det.get("result", {})
             practice = r.get("name")
             addr = r.get("formatted_address")
             site = (r.get("website") or "").strip()
-            principal, emails, email_src, principal_src, owner, founder = ("", set(), "", "", "", "")
+            principal, emails, email_src, principal_src, owner, founder, mobiles = ("", set(), "", "", "", "", [])
+
             if site:
-                principal, emails, email_src, principal_src, owner, founder = crawl_site(
+                principal, emails, email_src, principal_src, owner, founder, mobiles = crawl_site(
                     site,
                     max_pages=max_pages_per_site,
                     max_seconds=max_seconds_per_site,
                     progress_cb=None,
                     practice_name=practice
                 )
+
             return {
                 "Practice": practice or "",
                 "Address": addr or "",
@@ -412,8 +583,12 @@ def run_job(args):
                 "Emails found": ", ".join(sorted(emails)) if emails else "",
                 "First email source": email_src,
                 "Principal source": principal_src or site,
+                "Mobiles found": ", ".join([m["mobile"] for m in mobiles]) if mobiles else "",
+                "Mobile Name(s)": ", ".join([m["name"] for m in mobiles if m.get("name")]) if mobiles else "",
+                "Mobile Source(s)": ", ".join([m["source"] for m in mobiles]) if mobiles else "",
                 "Place ID": pid
             }
+
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
             idx = 0
             while idx < len(ids):
@@ -424,16 +599,21 @@ def run_job(args):
                         row = fut.result(timeout=PLACE_TIMEOUT)
                     except FuturesTimeout:
                         row = {"Practice":"","Address":"","Website":"","Principal / Owner (guess)":"",
-                               "Owner(s)":"","Founder(s)":"","Emails found":"","First email source":"","Principal source":"", "Place ID": futures[fut], "Error": f"Timeout after {PLACE_TIMEOUT}s"}
+                               "Owner(s)":"","Founder(s)":"","Emails found":"","First email source":"",
+                               "Principal source":"", "Mobiles found":"","Mobile Name(s)":"","Mobile Source(s)":"",
+                               "Place ID": futures[fut], "Error": f"Timeout after {PLACE_TIMEOUT}s"}
                     except Exception as e:
                         row = {"Practice":"","Address":"","Website":"","Principal / Owner (guess)":"",
-                               "Owner(s)":"","Founder(s)":"","Emails found":"","First email source":"","Principal source":"", "Place ID": futures[fut], "Error": f"{type(e).__name__}: {e}"}
-                    if row.get("Website") or row.get("Emails found") or row.get("Principal / Owner (guess)"):
+                               "Owner(s)":"","Founder(s)":"","Emails found":"","First email source":"",
+                               "Principal source":"", "Mobiles found":"","Mobile Name(s)":"","Mobile Source(s)":"",
+                               "Place ID": futures[fut], "Error": f"{type(e).__name__}: {e}"}
+                    if row.get("Website") or row.get("Emails found") or row.get("Principal / Owner (guess)") or row.get("Mobiles found"):
                         rows_buffer.append(row)
                     with job_lock:
                         job["current"] += 1
                 idx += len(batch)
                 set_job(progress=f"Scraping {job['current']}/{len(ids)}…")
+
         df = pd.DataFrame(rows_buffer)
         if "Place ID" in df.columns:
             df = df.drop_duplicates(subset=["Place ID"]).reset_index(drop=True)
@@ -445,6 +625,9 @@ def run_job(args):
     except Exception as e:
         set_job(running=False, error=f"Crash: {type(e).__name__}: {e}", progress="Stopped")
 
+# ==========================
+# Callbacks
+# ==========================
 @app.callback(
     Output("status","children"),
     Output("diag","children"),
@@ -512,7 +695,7 @@ def do_download(n):
         data = job["csv_bytes"]
     if not data:
         return no_update
-    return dcc.send_bytes(lambda b: b.write(data), "dental_clinics_with_emails.csv")
+    return dcc.send_bytes(lambda b: b.write(data), "dental_clinics_with_emails_and_mobiles.csv")
 
 if __name__ == "__main__":
     print("GOOGLE_API_KEY set?" , bool(os.getenv("GOOGLE_API_KEY")))
