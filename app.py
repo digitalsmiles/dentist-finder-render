@@ -12,9 +12,6 @@ from urllib3.util.retry import Retry
 
 from dash import Dash, html, dcc, Input, Output, State, dash_table, no_update
 
-# ==========================
-# Tunables (stable & safe)
-# ==========================
 CONNECT_TIMEOUT = 5
 READ_TIMEOUT = 25
 TIMEOUT = (CONNECT_TIMEOUT, READ_TIMEOUT)
@@ -223,9 +220,11 @@ def extract_mobiles_and_owners(soup, page_url):
         mobile = re.sub(r"\D", "", m.group(0))
         owner = ""
         before = text[:m.start()]
+        # Try to find the nearest "Dr ..." or name within 120 chars before the mobile
         dr_match = re.findall(r"(Dr\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})", before[-120:])
         if dr_match:
             owner = normalize_name(dr_match[-1])
+        # If no "Dr", try to find named staff or principal
         results.append({
             "mobile": mobile,
             "owner": owner,
@@ -290,9 +289,7 @@ def crawl_site(site_url: str, max_pages: int, max_seconds: int, progress_cb=None
         ", ".join(mobile_sources) if mobile_sources else ""
     )
 
-# ==========================
-# Dash app & UI
-# ==========================
+# Dash app and UI unchanged except for new columns
 job = {
     "running": False, "progress": "Ready", "current": 0, "total": 0,
     "rows": [], "csv_bytes": b"", "error": "", "diag": ""
@@ -533,22 +530,36 @@ def do_download(n):
         return no_update
     return dcc.send_bytes(lambda b: b.write(data), "dental_clinics_with_emails.csv")
 
-# ========== Google helpers, grid, etc. unchanged ==========
-
 def fetch_nearby_all_pages(gmaps_client, center, radius_m, type_="dentist"):
     out = []
-    for attempt in range(RETRIES + 1):
-        try:
-            resp = gmaps_client.places_nearby(location=center, radius=radius_m, type=type_)
-            out.extend(resp.get("results", []))
-            while "next_page_token" in resp:
-                time.sleep(NEARBY_SLEEP + random.random() * JITTER)
-                resp = gmaps_client.places_nearby(location=center, radius=radius_m, type=type_, page_token=resp["next_page_token"])
+    # OPTIMIZED: Also search 'dental_clinic' type for more results and deduplicate
+    for place_type in [type_, "dental_clinic"]:
+        page_token = None
+        tries = 0
+        while True:
+            try:
+                kwargs = {"location": center, "radius": radius_m, "type": place_type}
+                if page_token:
+                    kwargs["page_token"] = page_token
+                resp = gmaps_client.places_nearby(**kwargs)
                 out.extend(resp.get("results", []))
-            return out
-        except Exception:
-            time.sleep(0.6 * (2 ** attempt) + random.random() * JITTER)
-    return out
+                page_token = resp.get("next_page_token")
+                if not page_token:
+                    break
+                time.sleep(NEARBY_SLEEP + random.random() * JITTER)
+            except Exception as e:
+                print(f"Error fetching type={place_type} for tile {center}: {e}")
+                tries += 1
+                if tries > RETRIES:
+                    break
+                time.sleep(0.8 * (2 ** tries) + random.random() * JITTER)
+    # Remove duplicates by place_id
+    dedup = {}
+    for pl in out:
+        pid = pl.get("place_id")
+        if pid and pid not in dedup:
+            dedup[pid] = pl
+    return list(dedup.values())
 
 def gmaps_place_details(gmaps_client, place_id):
     for attempt in range(RETRIES + 1):
