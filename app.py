@@ -34,7 +34,7 @@ BINARY_EXTS = (
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+                  "(like Gecko) Chrome/124.0 Safari/537.36"
 }
 
 LIKELY_PATH_HINTS = [
@@ -43,7 +43,7 @@ LIKELY_PATH_HINTS = [
     "our-doctors","our-dentists","dentists","staff","people","providers"
 ]
 
-EMAIL_RE = re.compile(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", re.I)
+EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", re.I)
 AT_VARIANTS = r"(?:@|\s?[\[\(]{0,1}\s*at\s*[\]\)]{0,1}\s?)"
 DOT_VARIANTS = r"(?:\.|\s?dot\s?)"
 OBFUSCATED_EMAIL_RE = re.compile(
@@ -149,15 +149,26 @@ def extract_emails(soup: BeautifulSoup):
         # drop obvious file-like junk
         if any(e.endswith(ext) for ext in [".jpg",".jpeg",".png",".gif",".svg",".webp"]):
             continue
+        # Only allow plausible TLDs (filter out junk like .if, .local, etc)
+        allowed_tlds = [
+            ".com", ".net", ".org", ".edu", ".gov", ".co", ".uk", ".au", ".info", ".io", ".us", ".biz"
+        ]
+        if not any(e.endswith(tld) for tld in allowed_tlds):
+            continue
         found.add(e)
 
     # obfuscated forms like "info at domain dot com"
     for m in OBFUSCATED_EMAIL_RE.finditer(text):
         user, domain, tld = m.groups()
         addr = f"{user}@{domain}.{tld}".lower()
-        if EMAIL_RE.fullmatch(addr): found.add(addr)
+        if EMAIL_RE.fullmatch(addr):
+            allowed_tlds = [
+                ".com", ".net", ".org", ".edu", ".gov", ".co", ".uk", ".au", ".info", ".io", ".us", ".biz"
+            ]
+            if any(addr.endswith(tld) for tld in allowed_tlds):
+                found.add(addr)
 
-    return found
+    return set(found)
 
 # ==========================
 # Principal / owner extraction
