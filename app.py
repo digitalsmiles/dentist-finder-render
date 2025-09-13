@@ -24,7 +24,7 @@ CRAWL_SLEEP = 0.35
 NEARBY_SLEEP = 2.1
 JITTER = 0.25
 MAX_HTML_BYTES = 1_800_000
-MAX_WORKERS = 2  # keep small for stability on tiny instances
+MAX_WORKERS = 2
 
 BINARY_EXTS = (
     ".pdf",".doc",".docx",".xls",".xlsx",".ppt",".pptx",".zip",".rar",
@@ -37,35 +37,33 @@ HEADERS = {
                   "(like Gecko) Chrome/124.0 Safari/537.36"
 }
 
-LIKELY_PATH_HINTS = [
-    "contact","contact-us","book","appointments",
-    "about","about-us","our-team","team","meet-the-team",
-    "our-doctors","our-dentists","dentists","staff","people","providers"
-]
-
 EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", re.I)
-AT_VARIANTS = r"(?:@|\s?[\[\(]{0,1}\s*at\s*[\]\)]{0,1}\s?)"
-DOT_VARIANTS = r"(?:\.|\s?dot\s?)"
 OBFUSCATED_EMAIL_RE = re.compile(
-    rf"([A-Z0-9._%+\-]+)\s*{AT_VARIANTS}\s*([A-Z0-9.\-]+)\s*{DOT_VARIANTS}\s*([A-Z]{{2,}})",
+    r"([A-Z0-9._%+\-]+)\s*(?:@|\s?[\[\(]{0,1}\s*at\s*[\]\)]{0,1}\s?)\s*([A-Z0-9.\-]+)\s*(?:\.|\s?dot\s?)\s*([A-Z]{2,})",
     re.I
 )
+MOBILE_RE = re.compile(
+    r"\b(04\d{2}[-\s]?\d{3}[-\s]?\d{3}|(\+?61[-\s]?)?4\d{2}[-\s]?\d{3}[-\s]?\d{3})\b"
+)
 
-# Roles we will accept as "principal / owner"
 ROLE_OK = [
     "principal dentist", "practice owner", "owner",
     "lead dentist", "clinical director", "principal"
 ]
-# Roles we will explicitly exclude
+ROLE_OWNER = [
+    "practice owner", "owner", "managing director", "director", "general manager"
+]
+ROLE_FOUNDER = [
+    "founder", "co-founder"
+]
 ROLE_BLOCK = [
     "associate", "hygienist", "therapist", "oral health therapist",
     "assistant", "reception", "practice manager", "coordinator",
     "nurse", "specialist anaesthetist", "orthodontic therapist"
 ]
 
-# ==========================
-# HTTP session with retry
-# ==========================
+DR_NAME_RE = re.compile(r"(Dr\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})")
+
 def make_session():
     s = requests.Session()
     retry = Retry(
@@ -82,9 +80,6 @@ def make_session():
 
 SESSION = make_session()
 
-# ==========================
-# Utils
-# ==========================
 def slugify(s: str):
     s = unicodedata.normalize("NFKD", s).encode("ascii","ignore").decode("ascii")
     s = re.sub(r"[^A-Za-z0-9]+","_", s).strip("_")
@@ -132,32 +127,22 @@ def http_get(url: str):
         time.sleep(0.4 * (2 ** i) + random.random() * JITTER)
     return None, url
 
-# ==========================
-# Email extraction (stricter)
-# ==========================
 def extract_emails(soup: BeautifulSoup):
     found = set()
-    # strict mailto first
     for a in soup.select("a[href^='mailto:']"):
         addr = a.get("href","").split("mailto:")[-1].split("?")[0].strip()
         if EMAIL_RE.fullmatch(addr): found.add(addr.lower())
-
-    # visible text only
     text = soup.get_text(" ", strip=True)
     for m in EMAIL_RE.finditer(text):
         e = m.group(0).lower()
-        # drop obvious file-like junk
         if any(e.endswith(ext) for ext in [".jpg",".jpeg",".png",".gif",".svg",".webp"]):
             continue
-        # Only allow plausible TLDs (filter out junk like .if, .local, etc)
         allowed_tlds = [
             ".com", ".net", ".org", ".edu", ".gov", ".co", ".uk", ".au", ".info", ".io", ".us", ".biz"
         ]
         if not any(e.endswith(tld) for tld in allowed_tlds):
             continue
         found.add(e)
-
-    # obfuscated forms like "info at domain dot com"
     for m in OBFUSCATED_EMAIL_RE.finditer(text):
         user, domain, tld = m.groups()
         addr = f"{user}@{domain}.{tld}".lower()
@@ -167,52 +152,56 @@ def extract_emails(soup: BeautifulSoup):
             ]
             if any(addr.endswith(tld) for tld in allowed_tlds):
                 found.add(addr)
-
     return set(found)
 
-# ==========================
-# Principal / owner extraction (creative)
-# ==========================
-NAME_RE = re.compile(r"^(?:Dr\.?\s*)?[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}$")
-DR_NAME_RE = re.compile(r"(Dr\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})")
+def extract_mobiles(text):
+    matches = MOBILE_RE.findall(text)
+    cleaned = []
+    for m in matches:
+        number = re.sub(r"\D", "", m[0])
+        if number.startswith("61") and len(number) == 11:
+            number = "0" + number[2:]
+        if number.startswith("04") and len(number) == 10:
+            cleaned.append(number)
+    return list(set(cleaned))
 
 def norm_space(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
 
 def normalize_name(txt: str):
     txt = norm_space(txt)
-    # ensure it begins with "Dr " if a title is present
     if re.match(r"(?i)^dr\.?\s+", txt):
         txt = re.sub(r"(?i)^dr\.?\s*", "Dr ", txt).strip()
     return txt
 
-def role_is_ok(role_text: str) -> bool:
+def dedupe(names):
+    return list(dict.fromkeys([normalize_name(x) for x in names if x]))
+
+def role_is(role_text: str, role_list):
     t = role_text.lower()
-    if any(b in t for b in ROLE_BLOCK):
-        return False
-    return any(ok in t for ok in ROLE_OK)
+    for block_word in ROLE_BLOCK:
+        if block_word in t:
+            return False
+    for ok_word in role_list:
+        if ok_word in t:
+            return True
+    return False
 
-def try_match_name_to_practice(practice_name, staff_names):
-    # Try to match last name in practice name to staff names
-    pn = practice_name.lower().replace("dental", "").replace("clinic", "").strip()
-    for name in staff_names:
-        last = name.split()[-1].lower()
-        if last in pn:
-            return name
-    return ""
-
-def nearby_text(node) -> str:
-    bits = [node.get_text(" ", strip=True)]
-    parent = node.parent
-    if parent:
-        bits.append(parent.get_text(" ", strip=True))
-        for sib in parent.find_all(recursive=False):
-            if sib is not node:
-                bits.append(sib.get_text(" ", strip=True))
-    return norm_space(" ".join(bits))
-
-def find_principal_in_structured_data(soup: BeautifulSoup):
-    # JSON-LD Person with jobTitle
+def find_people_by_role(soup: BeautifulSoup, role_list):
+    people = []
+    for tag in soup.find_all(["h1","h2","h3","h4","strong","b","p","li","span","div"]):
+        t = norm_space(tag.get_text(" ", strip=True))
+        if not t:
+            continue
+        m = DR_NAME_RE.search(t)
+        name = m.group(1) if m else ""
+        if name and role_is(t, role_list):
+            people.append(name)
+        for ok_word in role_list:
+            pat = re.compile(rf"{ok_word}\s*[:\-]?\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)", re.I)
+            m2 = pat.search(t)
+            if m2:
+                people.append(normalize_name(m2.group(1)))
     for tag in soup.find_all("script", type=lambda t: t and "ld+json" in t):
         try:
             data = json.loads(tag.string or "")
@@ -224,320 +213,83 @@ def find_principal_in_structured_data(soup: BeautifulSoup):
             graphs = it.get("@graph") if isinstance(it.get("@graph"), list) else [it]
             for obj in graphs:
                 if not isinstance(obj, dict): continue
-                if obj.get("@type") in ("Person", ["Person"]):
-                    name = obj.get("name") or ""
-                    job = obj.get("jobTitle") or ""
-                    if name and job and role_is_ok(str(job)):
-                        m = DR_NAME_RE.search(name)
-                        if m:
-                            return normalize_name(m.group(1))
-                        if "owner" in str(job).lower():
-                            return normalize_name(name)
-    return ""
+                job = obj.get("jobTitle") or ""
+                name = obj.get("name") or ""
+                if name and role_is(job, role_list):
+                    people.append(normalize_name(name))
+    seen = set()
+    return [x for x in people if not (x in seen or seen.add(x))]
 
-def find_team_names(soup: BeautifulSoup):
-    team_names = []
-    team_like = soup.find_all(class_=lambda c: c and any(k in c.lower() for k in [
-        "team", "staff", "doctor", "dentist", "people", "provider", "bio", "profile", "member", "card"
-    ]))
-    for block in team_like:
-        text = block.get_text(" ", strip=True)
-        m = DR_NAME_RE.search(text)
-        if m:
-            team_names.append(normalize_name(m.group(1)))
-        else:
-            for h in block.find_all(["h1","h2","h3","h4","strong","b"]):
-                ht = norm_space(h.get_text(" ", strip=True))
-                if DR_NAME_RE.search(ht):
-                    team_names.append(normalize_name(DR_NAME_RE.search(ht).group(1)))
-    return team_names
-
-def find_principal_on_team_like_pages(soup: BeautifulSoup, practice_name=""):
-    candidates = []
-
-    team_names = find_team_names(soup)
-    # Creative: Try last name in practice name
-    matched = try_match_name_to_practice(practice_name, team_names)
-    if matched:
-        return matched
-
-    # Normal role-based scan
-    team_like = soup.find_all(class_=lambda c: c and any(k in c.lower() for k in [
-        "team","staff","doctor","dentist","people","provider","bio","profile","member","card"
-    ]))
-    for block in team_like:
-        text = block.get_text(" ", strip=True)
-        name = ""
-        m = DR_NAME_RE.search(text)
-        if m:
-            name = normalize_name(m.group(1))
-        else:
-            for h in block.find_all(["h1","h2","h3","h4","strong","b"]):
-                ht = norm_space(h.get_text(" ", strip=True))
-                if DR_NAME_RE.search(ht):
-                    name = normalize_name(DR_NAME_RE.search(ht).group(1))
-                    break
-
-        if not name:
-            continue
-
-        vicinity = nearby_text(block)
-        if role_is_ok(vicinity):
-            candidates.append(name)
-
-    # Heuristic: if About/History page is present, look for named founder/owner
-    for h in soup.find_all(["h1","h2","h3","h4","strong","b","p","li","span"]):
-        t = norm_space(h.get_text(" ", strip=True))
-        m = DR_NAME_RE.search(t)
-        if not m:
-            continue
-        name = normalize_name(m.group(1))
-        if role_is_ok(t):
-            candidates.append(name)
-
-    if candidates:
-        return candidates[0]
-    # Fall back to matching team name to practice name
-    if team_names:
-        matched = try_match_name_to_practice(practice_name, team_names)
-        if matched:
-            return matched
-        return team_names[0]
-    return ""
-
-def guess_principal_creative(soup: BeautifulSoup, practice_name="") -> str:
-    # 1) Structured data first
-    name = find_principal_in_structured_data(soup)
-    if name:
-        return name
-    # 2) Team-like layout with role labels and creative name matching
-    name = find_principal_on_team_like_pages(soup, practice_name)
-    if name:
-        return name
-
-    # 3) Text patterns like "Principal Dentist: Dr X", "Practice Owner Dr X"
+def find_principal_by_dr_pattern(soup: BeautifulSoup):
     text = soup.get_text(" ", strip=True)
-    pat1 = re.compile(
-        r"(Dr\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\s*[,|\-]?\s*(Principal\s+Dentist|Practice\s+Owner|Owner|Lead\s+Dentist|Clinical\s+Director)",
-        re.I
-    )
-    m = pat1.search(text)
-    if m:
-        return normalize_name(m.group(1))
+    matches = DR_NAME_RE.findall(text)
+    seen = set()
+    return [normalize_name(m) for m in matches if m not in seen and not seen.add(m)]
 
-    pat2 = re.compile(
-        r"(Principal\s+Dentist|Practice\s+Owner|Owner|Lead\s+Dentist|Clinical\s+Director)\s*[:\-]?\s*"
-        r"(Dr\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})",
-        re.I
-    )
-    m = pat2.search(text)
-    if m:
-        return normalize_name(m.group(2))
-
-    # Fallback: match any team name to practice
-    team_names = find_team_names(soup)
-    matched = try_match_name_to_practice(practice_name, team_names)
-    if matched:
-        return matched
-    if team_names:
-        return team_names[0]
-    return ""
-
-# ==========================
-# Crawl helpers (priority only)
-# ==========================
-def prioritise(urls):
-    def score(u):
-        path = urlparse(u).path.lower().strip("/")
-        return 0 if any(tok in path for tok in LIKELY_PATH_HINTS) else 1
-    return sorted(set(urls), key=score)
-
-def sitemap_urls_from_robots(base_url):
-    try:
-        robots_url = urljoin(base_url, "/robots.txt")
-        txt, _ = http_get(robots_url)
-        if not txt: return []
-        urls = []
-        for line in txt.splitlines():
-            if line.lower().startswith("sitemap:"):
-                sm = line.split(":",1)[1].strip()
-                if sm: urls.append(sm)
-        return urls
-    except Exception:
-        return []
-
-def parse_sitemap(url):
-    try:
-        xml, _ = http_get(url)
-        if not xml: return []
-        soup = BeautifulSoup(xml, "xml")
-        locs = [loc.get_text(strip=True) for loc in soup.find_all("loc")]
-        return [l for l in locs if l]
-    except Exception:
-        return []
-
-def sitemap_seed(base_url):
-    seeds = []
-    try:
-        for sm in sitemap_urls_from_robots(base_url):
-            seeds.extend(parse_sitemap(sm))
-        seeds.extend(parse_sitemap(urljoin(base_url, "/sitemap.xml")))
-    except Exception:
-        pass
-    seeds = [u for u in seeds if same_site(base_url, u)]
-    return prioritise(seeds)[:1000]
-
-# ==========================
-# Full-site crawler (bounded)
-# ==========================
 def crawl_site(site_url: str, max_pages: int, max_seconds: int, progress_cb=None, practice_name=None):
     t0 = time.time()
     html, canon = http_get(site_url)
-    if not html: return "", set(), "", site_url
-
+    if not html: return "", set(), "", site_url, "", "", ""
     queue, seen = deque(), set()
     queue.append(canon); seen.add(canon)
-
-    for su in sitemap_seed(canon):
-        if su not in seen:
-            seen.add(su); queue.append(su)
-
-    principal, principal_src = "", canon
+    principal_candidates, owners, founders = [], [], []
     emails, email_src = set(), {}
     pages_scanned = 0
-
     while queue and pages_scanned < max_pages and (time.time() - t0) < max_seconds:
         url = queue.popleft()
         pages_scanned += 1
-
         html, final_url = http_get(url)
         if not html:
             if progress_cb: progress_cb(pages_scanned, max_pages)
             continue
-
         soup = BeautifulSoup(html, "lxml")
-
-        # emails
         found = extract_emails(soup)
         for e in found:
             email_src.setdefault(e, final_url)
         emails |= found
-
-        # creative principal detection only when role is present
-        if not principal:
-            g = guess_principal_creative(soup, practice_name)
-            if g:
-                principal, principal_src = g, final_url
-
-        # follow internal links
+        page_text = soup.get_text(" ", strip=True)
+        principal_candidates += find_principal_by_dr_pattern(soup)
+        owners += find_people_by_role(soup, ROLE_OWNER)
+        founders += find_people_by_role(soup, ROLE_FOUNDER)
         internal = []
         for a in soup.find_all("a", href=True):
             u = normalize_abs(final_url, a["href"])
             if u and same_site(canon, u) and u not in seen:
                 internal.append(u)
-        for u in prioritise(internal):
+        for u in internal:
             seen.add(u); queue.append(u)
-
         if progress_cb: progress_cb(pages_scanned, max_pages)
         time.sleep(CRAWL_SLEEP + random.random() * JITTER)
-
+    principal_candidates = dedupe(principal_candidates)
+    owners = dedupe(owners)
+    founders = dedupe(founders)
     first_email = next(iter(emails)) if emails else ""
-    first_email_source = email_src.get(first_email, "")
-    return principal, emails, first_email_source, principal_src
+    first_email_source = ""
+    if first_email:
+        first_email_source = email_src.get(first_email, "")
+    return (
+        ", ".join(principal_candidates) if principal_candidates else "",
+        emails,
+        first_email_source,
+        site_url,
+        ", ".join(owners) if owners else "",
+        ", ".join(founders) if founders else ""
+    )
 
 # ==========================
-# Google helpers
-# ==========================
-def fetch_nearby_all_pages(gmaps_client, center, radius_m, type_="dentist"):
-    out = []
-    for attempt in range(RETRIES + 1):
-        try:
-            resp = gmaps_client.places_nearby(location=center, radius=radius_m, type=type_)
-            out.extend(resp.get("results", []))
-            while "next_page_token" in resp:
-                time.sleep(NEARBY_SLEEP + random.random() * JITTER)
-                resp = gmaps_client.places_nearby(location=center, radius=radius_m, type=type_, page_token=resp["next_page_token"])
-                out.extend(resp.get("results", []))
-            return out
-        except Exception:
-            time.sleep(0.6 * (2 ** attempt) + random.random() * JITTER)
-    return out
-
-def gmaps_place_details(gmaps_client, place_id):
-    for attempt in range(RETRIES + 1):
-        try:
-            return gmaps_client.place(place_id=place_id, fields=["name","formatted_address","website"])
-        except Exception:
-            time.sleep(0.6 * (2 ** attempt) + random.random() * JITTER)
-    return {"result": {}}
-
-def km_to_deg(lat_deg: float, km: float):
-    deg_lat = km / 111.0
-    deg_lon = km / (111.320 * math.cos(math.radians(lat_deg)) or 1e-6)
-    return deg_lat, deg_lon
-
-def make_grid(north, south, east, west, radius_km, step_factor=1.6):
-    mid_lat = (north + south) / 2.0
-    step_km = radius_km * step_factor
-    dlat, dlon = km_to_deg(mid_lat, step_km)
-    lat = south + dlat/2.0
-    while lat < north:
-        lon = west + dlon/2.0
-        while lon < east:
-            yield (lat, lon)
-            lon += dlon
-        lat += dlat
-
-def sort_center_out(points, center_lat, center_lon):
-    def key(pt):
-        lat, lon = pt
-        dx = (lon - center_lon) * math.cos(math.radians(center_lat))
-        dy = (lat - center_lat)
-        return dx*dx + dy*dy
-    return sorted(points, key=key)
-
-def geocode_viewport(gmaps_client, place_text: str):
-    g = None
-    for attempt in range(RETRIES + 1):
-        try:
-            g = gmaps_client.geocode(place_text, region="au")
-            break
-        except Exception:
-            time.sleep(0.6 * (2 ** attempt) + random.random() * JITTER)
-    if not g: return None
-    res = g[0]
-    geom = res.get("geometry", {})
-    vp = geom.get("viewport")
-    if vp:
-        ne = vp.get("northeast", {}); sw = vp.get("southwest", {})
-        north, south = float(ne.get("lat")), float(sw.get("lat"))
-        east, west   = float(ne.get("lng")), float(sw.get("lng"))
-        north, south = max(north, south), min(north, south)
-        east, west   = max(east, west),   min(east, west)
-        return north, south, east, west
-    loc = geom.get("location")
-    if not loc: return None
-    lat, lng = float(loc["lat"]), float(loc["lng"])
-    dlat, dlon = km_to_deg(lat, 50.0)
-    return lat + dlat, lat - dlat, lng + dlon, lng - dlon
-
-# ==========================
-# Background job state
+# Rest of Dash app and worker logic unchanged, just add Owner and Founder columns
 # ==========================
 job = {
     "running": False, "progress": "Ready", "current": 0, "total": 0,
     "rows": [], "csv_bytes": b"", "error": "", "diag": ""
 }
 job_lock = threading.Lock()
-
 def set_job(**updates):
     with job_lock:
         job.update(updates)
-
 def is_job_running():
     with job_lock:
         return job.get("running", False)
-
 def reset_job():
     with job_lock:
         job.update({
@@ -545,9 +297,6 @@ def reset_job():
             "rows": [], "csv_bytes": b"", "error": "", "diag": ""
         })
 
-# ==========================
-# Dash app & layout
-# ==========================
 app = Dash(__name__, title="Dental Finder (Dash)", suppress_callback_exceptions=True)
 server = app.server
 
@@ -556,10 +305,8 @@ app.layout = html.Div(
     style={"fontFamily":"system-ui,-apple-system,Segoe UI,Arial","maxWidth":"1100px","margin":"0 auto","padding":"18px"},
     children=[
         html.H2("Dental Finder 🦷"),
-
         html.Label("Place (AU city / suburb / state / postcode)"),
         dcc.Input(id="place_text", value="Brisbane QLD", style={"width":"60%"}),
-
         html.Div([
             html.Div([html.Label("Nearby radius (km)"),
                       dcc.Input(id="radius_km", type="number", value=2.5, step=0.5)]),
@@ -570,75 +317,60 @@ app.layout = html.Div(
             html.Div([html.Label("Max clinics to collect"),
                       dcc.Input(id="max_total_places", type="number", value=3000, step=100)]),
         ], style={"marginTop":"8px","display":"grid","gridTemplateColumns":"repeat(4, minmax(180px,1fr))","gap":"10px"}),
-
         html.Div([
             html.Div([html.Label("Max pages per site"),
                       dcc.Input(id="max_pages_per_site", type="number", value=80, step=5)]),
             html.Div([html.Label("Max seconds per site"),
                       dcc.Input(id="max_seconds_per_site", type="number", value=90, step=5)]),
         ], style={"marginTop":"8px","display":"grid","gridTemplateColumns":"repeat(2, minmax(220px,1fr))","gap":"10px"}),
-
         html.Br(),
         html.Button("Start sweep", id="start", n_clicks=0, style={"padding":"8px 14px"}),
         html.Span(id="status", style={"marginLeft":"12px"}),
-
         html.Div(id="diag", style={"marginTop":"6px", "fontSize":"12px", "opacity":0.8}),
-
         html.Div(style={"height":"14px"}),
         html.Div(id="progress-bar", style={"height":"10px","background":"#eee","borderRadius":"6px","overflow":"hidden"}),
         html.Div(id="progress-info", style={"marginTop":"6px"}),
-
         html.Hr(),
         dash_table.DataTable(
             id="table", page_size=10,
             style_cell={"whiteSpace":"normal","height":"auto"},
             style_table={"maxHeight":"520px","overflowY":"auto"}
         ),
-
         html.Br(),
         html.Button("Download CSV", id="download-btn"),
         dcc.Download(id="download"),
-
         dcc.Store(id="kick"),
         dcc.Interval(id="poll", interval=1500, n_intervals=0),
     ]
 )
 
-# --------------------------
-# Worker
-# --------------------------
 def run_job(args):
     try:
         set_job(progress="Starting worker…", running=True, error="", diag="")
-
         api_key = (os.getenv("GOOGLE_API_KEY") or os.getenv("GMAPS_KEY") or "").strip()
         if not api_key:
             set_job(running=False, error="No Google API key found in env (GOOGLE_API_KEY or GMAPS_KEY).",
                     progress="Stopped")
             return
-
         gmaps_client = googlemaps.Client(key=api_key)
-
         place_text = args.get("place_text") or "Brisbane QLD"
+        radius_km = float(args.get("radius_km", 2.5))
+        step_factor = float(args.get("step_factor", 1.5))
+        max_tiles = int(args.get("max_tiles", 200))
+        max_total_places = int(args.get("max_total_places", 3000))
+        max_pages_per_site = int(args.get("max_pages_per_site", 80))
+        max_seconds_per_site = int(args.get("max_seconds_per_site", 90))
         vp = geocode_viewport(gmaps_client, place_text)
         if not vp:
             set_job(running=False, error=f"Could not geocode: {place_text}", progress="Stopped")
             return
         north, south, east, west = vp
-
-        radius_km = float(args.get("radius_km", 2.5))
-        step_factor = float(args.get("step_factor", 1.5))
-        max_tiles = int(args.get("max_tiles", 200))
-        max_total_places = int(args.get("max_total_places", 3000))
-
         centers_all = list(make_grid(north, south, east, west, radius_km, step_factor))
         center_lat = (north + south)/2.0
         center_lon = (east + west)/2.0
         centers_sorted = sort_center_out(centers_all, center_lat, center_lon)
         centers = centers_sorted[:max_tiles] if len(centers_sorted) > max_tiles else centers_sorted
-
         set_job(diag=f"Key: OK • Tiles planned: {len(centers)} • Max clinics: {max_total_places}")
-
         place_ids = {}
         for i, (lat, lon) in enumerate(centers, start=1):
             set_job(progress=f"Discovery {i}/{len(centers)} tiles…")
@@ -649,40 +381,39 @@ def run_job(args):
                     place_ids[pid] = pl
                     if len(place_ids) >= max_total_places: break
             if len(place_ids) >= max_total_places: break
-
         if not place_ids:
             set_job(running=False, error="No clinics found.", progress="Stopped")
             return
-
         ids = list(place_ids.keys())
         rows_buffer = []
         set_job(progress="Scraping details…", current=0, total=len(ids))
-
         def worker(pid):
             det = gmaps_place_details(gmaps_client, pid)
             r = det.get("result", {})
             practice = r.get("name")
             addr = r.get("formatted_address")
             site = (r.get("website") or "").strip()
-
-            principal, emails, email_src, principal_src = ("", set(), "", "")
+            principal, emails, email_src, principal_src, owner, founder = ("", set(), "", "", "", "")
             if site:
-                principal, emails, email_src, principal_src = crawl_site(
+                principal, emails, email_src, principal_src, owner, founder = crawl_site(
                     site,
-                    max_pages=int(args.get("max_pages_per_site", 80)),
-                    max_seconds=int(args.get("max_seconds_per_site", 90)),
+                    max_pages=max_pages_per_site,
+                    max_seconds=max_seconds_per_site,
                     progress_cb=None,
                     practice_name=practice
                 )
-
             return {
-                "Practice": practice or "", "Address": addr or "", "Website": site,
+                "Practice": practice or "",
+                "Address": addr or "",
+                "Website": site,
                 "Principal / Owner (guess)": principal,
+                "Owner(s)": owner,
+                "Founder(s)": founder,
                 "Emails found": ", ".join(sorted(emails)) if emails else "",
-                "First email source": email_src, "Principal source": principal_src or site,
+                "First email source": email_src,
+                "Principal source": principal_src or site,
                 "Place ID": pid
             }
-
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
             idx = 0
             while idx < len(ids):
@@ -693,37 +424,27 @@ def run_job(args):
                         row = fut.result(timeout=PLACE_TIMEOUT)
                     except FuturesTimeout:
                         row = {"Practice":"","Address":"","Website":"","Principal / Owner (guess)":"",
-                               "Emails found":"","First email source":"","Principal source":"",
-                               "Place ID": futures[fut], "Error": f"Timeout after {PLACE_TIMEOUT}s"}
+                               "Owner(s)":"","Founder(s)":"","Emails found":"","First email source":"","Principal source":"", "Place ID": futures[fut], "Error": f"Timeout after {PLACE_TIMEOUT}s"}
                     except Exception as e:
                         row = {"Practice":"","Address":"","Website":"","Principal / Owner (guess)":"",
-                               "Emails found":"","First email source":"","Principal source":"",
-                               "Place ID": futures[fut], "Error": f"{type(e).__name__}: {e}"}
-
+                               "Owner(s)":"","Founder(s)":"","Emails found":"","First email source":"","Principal source":"", "Place ID": futures[fut], "Error": f"{type(e).__name__}: {e}"}
                     if row.get("Website") or row.get("Emails found") or row.get("Principal / Owner (guess)"):
                         rows_buffer.append(row)
-
                     with job_lock:
                         job["current"] += 1
                 idx += len(batch)
                 set_job(progress=f"Scraping {job['current']}/{len(ids)}…")
-
         df = pd.DataFrame(rows_buffer)
         if "Place ID" in df.columns:
             df = df.drop_duplicates(subset=["Place ID"]).reset_index(drop=True)
-
         buf = io.BytesIO()
         df.to_csv(buf, index=False)
         buf.seek(0)
-
         set_job(running=False, progress=f"Done. {len(df)} clinics.",
                 rows=df.to_dict("records"), csv_bytes=buf.read(), error="")
     except Exception as e:
         set_job(running=False, error=f"Crash: {type(e).__name__}: {e}", progress="Stopped")
 
-# --------------------------
-# Poll UI for progress
-# --------------------------
 @app.callback(
     Output("status","children"),
     Output("diag","children"),
@@ -748,9 +469,6 @@ def poll_status(_):
     status = ("⏳ " if running else "✅ ") + prog
     return status, diag, bar, info, rows
 
-# --------------------------
-# Start job (only one at a time)
-# --------------------------
 @app.callback(
     Output("kick","data"),
     Input("start","n_clicks"),
@@ -784,9 +502,6 @@ def start(n, place_text, radius_km, step_factor, max_tiles, max_total_places,
     threading.Thread(target=run_job, args=(args,), daemon=True).start()
     return {"msg":"started", "ts": time.time()}
 
-# --------------------------
-# Download CSV
-# --------------------------
 @app.callback(
     Output("download","data"),
     Input("download-btn","n_clicks"),
@@ -799,9 +514,6 @@ def do_download(n):
         return no_update
     return dcc.send_bytes(lambda b: b.write(data), "dental_clinics_with_emails.csv")
 
-# --------------------------
-# Entry
-# --------------------------
 if __name__ == "__main__":
     print("GOOGLE_API_KEY set?" , bool(os.getenv("GOOGLE_API_KEY")))
     print("GMAPS_KEY set?"       , bool(os.getenv("GMAPS_KEY")))
